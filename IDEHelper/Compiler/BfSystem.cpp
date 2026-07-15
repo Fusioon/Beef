@@ -522,7 +522,42 @@ BfMethodDef::~BfMethodDef()
 
 BfImportKind BfMethodDef::GetImportKindFromPath(const StringImpl& filePath)
 {
-	String fileExt = GetFileExtension(filePath);
+	int versionNumberCount = 3; // Allow 3 version numbers at most
+	int lastDotIndex = filePath.length();
+
+	int i;
+	for (i = filePath.length() - 1; i >= 0; i--)
+	{
+		char c = filePath[i];
+		if ((c >= '0') && (c <= '9'))
+		{
+			continue;
+		}
+		
+		if ((c == '.'))
+		{
+			if ((--versionNumberCount >= 0) && (i != lastDotIndex - 1))
+			{
+				lastDotIndex = i;
+				continue;
+			}
+			
+			break;
+		}
+
+		if ((c == '/') || (c == '\\'))
+		{
+			break;
+		}
+
+		versionNumberCount = 0;
+	}
+
+	String fileExt;
+	if (i > 0)
+	{
+		fileExt = filePath.Substring(i, lastDotIndex - i);
+	}
 
 	if ((fileExt.Equals(".DYLIB", StringImpl::CompareKind_OrdinalIgnoreCase)) ||
 		(fileExt.Equals(".SO", StringImpl::CompareKind_OrdinalIgnoreCase)) ||
