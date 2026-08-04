@@ -453,14 +453,9 @@ public:
 
 };
 
-
-FileWatchManager* FileWatchManager::Get()
+FileWatchManager* FileWatchManager::Allocate()
 {
-    if (gFileWatchManager == NULL)
-    {
-        gFileWatchManager = new InotifyFileWatchManager();
-        gFileWatchManager->Init();
-    }
-    return gFileWatchManager;
+    return new InotifyWatchManager();
 }
+
 #endif // BFP_HAS_FILEWATCHER
