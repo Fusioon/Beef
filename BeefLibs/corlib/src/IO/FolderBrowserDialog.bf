@@ -1,15 +1,18 @@
 namespace System.IO;
 
-
-#if BF_PLATFORM_WINDOWS
-class FolderBrowserDialog : CommonDialog
+class CommonFolderDialog : CommonDialog
 {
 	public enum FolderKind
 	{
 		Open,
 		Save
 	}
+}
 
+
+#if BF_PLATFORM_WINDOWS
+class FolderBrowserDialog : CommonDialog
+{
 	String mSelectedPath = new String() ~ delete _;
 	public bool ShowNewFolderButton;
 	String mDescriptionText = new String() ~ delete _;
@@ -266,12 +269,17 @@ public class FolderBrowserDialog : CommonDialog
 
 #elif BF_PLATFORM_MACOS
 
-public class FolderBrowserDialog : CommonDialog
+public class FolderBrowserDialog : CommonFolderDialog
 {
 	public StringView SelectedPath
 	{
 		get;
 		set;
+	}
+
+	public this(FolderKind kind = .Open)
+	{
+		
 	}
 }
 

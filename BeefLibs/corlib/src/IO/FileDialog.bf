@@ -917,7 +917,15 @@ public abstract class FileDialog : CommonDialog
 
 #elif BF_PLATFORM_MACOS
 
-public abstract class FileDialog
+class CommonDialog
+{
+	public Result<DialogResult> ShowDialog(INativeWindow owner = null)
+	{
+		return default;
+	}
+}
+
+public abstract class FileDialog : CommonDialog
 {
 	public void Reset() {}
 	
@@ -933,15 +941,15 @@ public abstract class FileDialog
 	
 	public virtual bool CheckFileExists { get; set; }
 	
-	bool DereferenceLinks { get; set; }
+	public bool DereferenceLinks { get; set; }
 	
-	bool CheckPathExists { get; set; }
+	public bool CheckPathExists { get; set; }
 	
 	public bool Multiselect { get; set; }
 	
-	bool ValidateNames { get; set; }
+	public bool ValidateNames { get; set; }
 	
-	StringView DefaultExt { get; set; }		
+	public StringView DefaultExt { get; set; }		
 	
 	public void GetFilter(String outFilter) {}
 	
