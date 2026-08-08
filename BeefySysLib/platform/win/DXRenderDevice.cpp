@@ -1582,30 +1582,7 @@ void Beefy::DXModelInstance::CommandQueued(RenderCmd* renderCmd, DrawLayer* draw
 
 #ifndef BF_NO_FBX
 	Matrix4 jointsMatrices[BF_MAX_NUM_BONES];
-	for (int jointIdx = 0; jointIdx < (int)mJointTranslations.size(); jointIdx++)
-	{
-		ModelJoint* joint = &mModelDef->mJoints[jointIdx];
-
-		BF_ASSERT(joint->mParentIdx < jointIdx);
-
-		ModelJointTranslation* jointPosition = &mJointTranslations[jointIdx];
-
-		Matrix4* mtx = &jointsMatrices[jointIdx];
-
-		*mtx = Matrix4::CreateTransform(jointPosition->mTrans, jointPosition->mScale, jointPosition->mQuat);
-		if (joint->mParentIdx >= 0)
-		{
-			 Matrix4* parentMatrix = &jointsMatrices[joint->mParentIdx];
-			 *mtx = Matrix4::Multiply(*parentMatrix, *mtx);
-		}
-	}
-
-	for (int jointIdx = 0; jointIdx < (int)mModelDef->mJoints.size(); jointIdx++)
-	{
-		ModelJoint* joint = &mModelDef->mJoints[jointIdx];
-		Matrix4* mtx = &jointsMatrices[jointIdx];
-		*mtx = Matrix4::Multiply(*mtx, joint->mPoseInvMatrix);
-	}
+	ComputeSkinningJointMatrices(jointsMatrices);
 
 	for (int meshIdx = 0; meshIdx < (int) mModelDef->mMeshes.size(); meshIdx++)
 	{
@@ -1634,30 +1611,39 @@ void Beefy::DXModelInstance::CommandQueued(RenderCmd* renderCmd, DrawLayer* draw
 
 				float totalWeight = 0;
 
-				for (int weightIdx = 0; weightIdx < srcVtxData->mNumBoneWeights; weightIdx++)
+				if (srcVtxData->mNumBoneWeights > 0)
 				{
-					int jointIdx = srcVtxData->mBoneIndices[weightIdx];
-					float boneWeight = srcVtxData->mBoneWeights[weightIdx];
+					for (int weightIdx = 0; weightIdx < srcVtxData->mNumBoneWeights; weightIdx++)
+					{
+						int jointIdx = srcVtxData->mBoneIndices[weightIdx];
+						float boneWeight = srcVtxData->mBoneWeights[weightIdx];
 
-					Matrix4* mtx = &jointsMatrices[jointIdx];
+						Matrix4* mtx = &jointsMatrices[jointIdx];
 
-					vtx = vtx + Vector3::Transform(srcVtxData->mPosition, *mtx) * boneWeight;
+						vtx = vtx + Vector3::Transform(srcVtxData->mPosition, *mtx) * boneWeight;
 
-					Vector3 origNormal = srcVtxData->mNormal;
-					normal = normal + Vector3(
-						mtx->m00 * origNormal.mX + mtx->m01 * origNormal.mY + mtx->m02 * origNormal.mZ,
-						mtx->m10 * origNormal.mX + mtx->m11 * origNormal.mY + mtx->m12 * origNormal.mZ,
-						mtx->m20 * origNormal.mX + mtx->m21 * origNormal.mY + mtx->m22 * origNormal.mZ) * boneWeight;
+						Vector3 origNormal = srcVtxData->mNormal;
+						normal = normal + Vector3(
+							mtx->m00 * origNormal.mX + mtx->m01 * origNormal.mY + mtx->m02 * origNormal.mZ,
+							mtx->m10 * origNormal.mX + mtx->m11 * origNormal.mY + mtx->m12 * origNormal.mZ,
+							mtx->m20 * origNormal.mX + mtx->m21 * origNormal.mY + mtx->m22 * origNormal.mZ) * boneWeight;
 
-					Vector3 origTangent = srcVtxData->mTangent;
-					tangent = tangent + Vector3(
-						mtx->m00 * origTangent.mX + mtx->m01 * origTangent.mY + mtx->m02 * origTangent.mZ,
-						mtx->m10 * origTangent.mX + mtx->m11 * origTangent.mY + mtx->m12 * origTangent.mZ,
-						mtx->m20 * origTangent.mX + mtx->m21 * origTangent.mY + mtx->m22 * origTangent.mZ) * boneWeight;
+						Vector3 origTangent = srcVtxData->mTangent;
+						tangent = tangent + Vector3(
+							mtx->m00 * origTangent.mX + mtx->m01 * origTangent.mY + mtx->m02 * origTangent.mZ,
+							mtx->m10 * origTangent.mX + mtx->m11 * origTangent.mY + mtx->m12 * origTangent.mZ,
+							mtx->m20 * origTangent.mX + mtx->m21 * origTangent.mY + mtx->m22 * origTangent.mZ) * boneWeight;
 
-					totalWeight += boneWeight;
+						totalWeight += boneWeight;
+					}
+					BF_ASSERT(fabs(totalWeight - 1.0) < 0.1f);
 				}
-				BF_ASSERT(fabs(totalWeight - 1.0) < 0.1f);
+				else
+				{
+					vtx = srcVtxData->mPosition;
+					normal = srcVtxData->mNormal;
+					tangent = srcVtxData->mTangent;
+				}
 
 				DXModelVertex* destVtx = dxVtxData + vtxIdx;
 
