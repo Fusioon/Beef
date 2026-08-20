@@ -53,6 +53,7 @@ static CFStringRef bf_kFSEventStreamEventExtendedFileIDKey = NULL;
 // CoreFoundation Function Pointers
 static const void* (*bf_CFArrayGetValueAtIndex)(CFArrayRef theArray, CFIndex idx) = NULL;
 static const void* (*bf_CFDictionaryGetValue)(CFDictionaryRef theDict, const void *key) = NULL;
+static const char* (*bf_CFStringGetCStringPtr)(CFStringRef theString, CFStringEncoding encoding) = NULL;
 static Boolean (*bf_CFStringGetCString)(CFStringRef theString, char *buffer, CFIndex bufferSize, CFStringEncoding encoding) = NULL;
 static Boolean (*bf_CFNumberGetValue)(CFNumberRef number, CFNumberType theType, void *valuePtr) = NULL;
 static CFRunLoopRef (*bf_CFRunLoopGetCurrent)(void) = NULL;
@@ -81,11 +82,6 @@ struct BfpFileWatcher
 	void* mUserData;
 };
 
-struct RenameInfo
-{
-	String mPath;
-	FSEventStreamEventId mEventId;
-};
 
 // Callback for watcher
 template <bool filter>
@@ -93,14 +89,17 @@ static void FSEventsCallback(
     ConstFSEventStreamRef streamRef,
     void* clientCallBackInfo,
     size_t numEvents,
-    void* eventPaths,
+    void* eventData,
     const FSEventStreamEventFlags eventFlags[],
     const FSEventStreamEventId eventIds[])
 {
 	BfpFileWatcher* watcher = (BfpFileWatcher*)clientCallBackInfo;
-	CFArrayRef dictArray = static_cast<CFArrayRef>(eventPaths);
+	CFArrayRef dictArray = static_cast<CFArrayRef>(eventData);
 
-	Dictionary<uint64_t, RenameInfo> renamedItems;
+	Dictionary<uint64_t, String> renamedItems;
+	HashSet<uint64_t> handledRenameIds;
+
+	char pathBuffer[PATH_MAX];
 
 	for (CFIndex i = 0; i < numEvents; i++)
 	{
@@ -125,12 +124,18 @@ static void FSEventsCallback(
 		CFStringRef pathCF = static_cast<CFStringRef>(
 			bf_CFDictionaryGetValue(dict, bf_kFSEventStreamEventExtendedDataPathKey)
 		);
-		char pathBuffer[PATH_MAX];
-		if (!bf_CFStringGetCString(pathCF, pathBuffer, sizeof(pathBuffer), kCFStringEncodingUTF8))
-			continue;
+
+		const char* path = bf_CFStringGetCStringPtr(pathCF, kCFStringEncodingUTF8);
+		if (path == NULL)
+		{
+			if (!bf_CFStringGetCString(pathCF, pathBuffer, sizeof(pathBuffer), kCFStringEncodingUTF8))
+				continue;
+
+			path = pathBuffer;
+		}
 
 		// Make event path relative to watched path
-		String absFilePath = StringImpl::MakeRef((char*)&pathBuffer);
+		String absFilePath = StringImpl::MakeRef(path);
 		String relativeFilePath = GetRelativePath(absFilePath, watcher->mAbsPath);
 		String relativeDirectoryPath = GetFileDir(relativeFilePath);
 
@@ -164,12 +169,12 @@ static void FSEventsCallback(
 			continue;
 		}
 
-		// Since events are coalesced into single event, we can have created and removed set
+		// Since events are coalesced into single event, we can have created and removed set at the same time
 		// Check if the file exists and remove the invalid flag
 		if ((flags & kFSEventStreamEventFlagItemRemoved) && (flags & (kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemCloned)))
 		{
 			struct stat sb;
-			bool exists = (stat(pathBuffer, &sb) == 0);
+			bool exists = (stat(absFilePath.c_str(), &sb) == 0);
 			if (exists)
 				flags &= ~kFSEventStreamEventFlagItemRemoved;
 			else
@@ -207,35 +212,28 @@ static void FSEventsCallback(
 			bf_CFNumberGetValue(fileIDCF, kCFNumberLongLongType, &fileID);
 
 			uint64_t* keyPtr;
-			RenameInfo* valPtr;
+			String* valPtr;
 
 			if (renamedItems.TryAdd(fileID, &keyPtr, &valPtr))
 			{
-				valPtr->mPath = absFilePath;
-				valPtr->mEventId = eventIds[i];
+				*valPtr = absFilePath;
 			}
 			else
 			{
-				String* newPath;
-				String* oldPath;
+				struct stat sb;
+				bool currentFileExists = (stat(absFilePath.c_str(), &sb) == 0);
+				bool storedFileExists = (stat(valPtr->c_str(), &sb) == 0);
+
+				if (currentFileExists)
+				{
+					
+				}
 
 				// Make the stored path relative
-				valPtr->mPath = GetRelativePath(valPtr->mPath, watcher->mAbsPath);
+				String oldPath = GetRelativePath(*valPtr, watcher->mAbsPath);
 
-				// First event ID should be the old path
-				if (eventIds[i] < valPtr->mEventId)
-				{
-					oldPath = &relativeFilePath;
-					newPath = &valPtr->mPath;
-				}
-				else
-				{
-					newPath = &relativeFilePath;
-					oldPath = &valPtr->mPath;
-				}
-
-				const auto newDirPathIdx = newPath->LastIndexOf('/');
-				const auto oldDirPathIdx = oldPath->LastIndexOf('/');
+				const auto newDirPathIdx = relativeFilePath.LastIndexOf('/');
+				const auto oldDirPathIdx = oldPath.LastIndexOf('/');
 
 				// Only handle as rename if it is within the same directory
 				bool isRename = false;
@@ -247,7 +245,7 @@ static void FSEventsCallback(
 					}
 					else
 					{
-						isRename = (String::Compare(*newPath, 0, *oldPath, 0, newDirPathIdx, false) == 0);
+						isRename = (String::Compare(relativeFilePath, 0, oldPath, 0, newDirPathIdx, false) == 0);
 					}
 				}
 
@@ -269,7 +267,10 @@ static void FSEventsCallback(
 						watcher->mDirectoryChangeFunc(watcher, watcher->mUserData, BfpFileChangeKind_Modified, watcher->mWatchPath.c_str(),dir.c_str(), NULL);
 				}
 
-				renamedItems.Remove(fileID);
+				// There might be a case where there are odd number of renames A -> B -> C
+				// so don't delete just update the entry and mark as handled
+				*valPtr = absFilePath;
+				handledRenameIds.Add(fileID);
 			}
 		}
 	}
@@ -381,6 +382,7 @@ bool FsEventFileWatchManager::Init()
 	// Resolve CoreFoundation functions
 	BF_CF_GET_SYM(CFArrayGetValueAtIndex);
 	BF_CF_GET_SYM(CFDictionaryGetValue);
+	BF_CF_GET_SYM(CFStringGetCStringPtr);
 	BF_CF_GET_SYM(CFStringGetCString);
 	BF_CF_GET_SYM(CFNumberGetValue);
 	BF_CF_GET_SYM(CFRunLoopGetCurrent);
