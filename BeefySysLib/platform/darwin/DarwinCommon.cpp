@@ -82,6 +82,11 @@ struct BfpFileWatcher
 	void* mUserData;
 };
 
+static bool CheckPathExists(const char* path)
+{
+	struct stat sb;
+	return (lstat(path, &sb) == 0);
+}
 
 // Callback for watcher
 template <bool filter>
@@ -96,8 +101,9 @@ static void FSEventsCallback(
 	BfpFileWatcher* watcher = (BfpFileWatcher*)clientCallBackInfo;
 	CFArrayRef dictArray = static_cast<CFArrayRef>(eventData);
 
+	// We do not handle renames across batches as that would needlessly complicate things
+	// if cross batch rename occurs then remove and add is emitted
 	Dictionary<uint64_t, String> renamedItems;
-	HashSet<uint64_t> handledRenameIds;
 
 	char pathBuffer[PATH_MAX];
 
@@ -173,9 +179,7 @@ static void FSEventsCallback(
 		// Check if the file exists and remove the invalid flag
 		if ((flags & kFSEventStreamEventFlagItemRemoved) && (flags & (kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemCloned)))
 		{
-			struct stat sb;
-			bool exists = (stat(absFilePath.c_str(), &sb) == 0);
-			if (exists)
+			if (CheckPathExists(absFilePath.c_str()))
 				flags &= ~kFSEventStreamEventFlagItemRemoved;
 			else
 				flags &= ~(kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemCloned);
@@ -193,17 +197,7 @@ static void FSEventsCallback(
 			if (!relativeDirectoryPath.empty())
 				watcher->mDirectoryChangeFunc(watcher, watcher->mUserData, BfpFileChangeKind_Modified, watcher->mWatchPath.c_str(),relativeDirectoryPath.c_str(), NULL);
 		}
-		else if (flags & (
-			kFSEventStreamEventFlagItemInodeMetaMod |
-			kFSEventStreamEventFlagItemModified |
-			kFSEventStreamEventFlagItemXattrMod |
-			kFSEventStreamEventFlagItemFinderInfoMod |
-			kFSEventStreamEventFlagItemChangeOwner))
-		{
-			watcher->mDirectoryChangeFunc(watcher, watcher->mUserData, BfpFileChangeKind_Modified, watcher->mWatchPath.c_str(),relativeFilePath.c_str(), NULL);
-		}
-
-		if (flags & kFSEventStreamEventFlagItemRenamed)
+		else if (flags & kFSEventStreamEventFlagItemRenamed)
 		{
 			CFNumberRef fileIDCF = static_cast<CFNumberRef>(
 				bf_CFDictionaryGetValue(dict, bf_kFSEventStreamEventExtendedFileIDKey)
@@ -220,20 +214,30 @@ static void FSEventsCallback(
 			}
 			else
 			{
-				struct stat sb;
-				bool currentFileExists = (stat(absFilePath.c_str(), &sb) == 0);
-				bool storedFileExists = (stat(valPtr->c_str(), &sb) == 0);
+				String* newPath;
+				String* oldPath;
 
-				if (currentFileExists)
+				if (CheckPathExists(absFilePath.c_str()))
 				{
-					
+					newPath = &relativeFilePath;
+					oldPath = valPtr;
+				}
+				else if (CheckPathExists(valPtr->c_str()))
+				{
+					oldPath = &relativeFilePath;
+					newPath = valPtr;
+				}
+				else
+				{
+					// Neither path does exist, might be A -> B -> C rename or removed just skip
+					continue;
 				}
 
 				// Make the stored path relative
-				String oldPath = GetRelativePath(*valPtr, watcher->mAbsPath);
+				*valPtr =  GetRelativePath(*valPtr, watcher->mAbsPath);
 
-				const auto newDirPathIdx = relativeFilePath.LastIndexOf('/');
-				const auto oldDirPathIdx = oldPath.LastIndexOf('/');
+				const auto newDirPathIdx = newPath->LastIndexOf('/');
+				const auto oldDirPathIdx = oldPath->LastIndexOf('/');
 
 				// Only handle as rename if it is within the same directory
 				bool isRename = false;
@@ -245,7 +249,7 @@ static void FSEventsCallback(
 					}
 					else
 					{
-						isRename = (String::Compare(relativeFilePath, 0, oldPath, 0, newDirPathIdx, false) == 0);
+						isRename = (String::Compare(*newPath, 0, *oldPath, 0, newDirPathIdx, false) == 0);
 					}
 				}
 
@@ -267,20 +271,26 @@ static void FSEventsCallback(
 						watcher->mDirectoryChangeFunc(watcher, watcher->mUserData, BfpFileChangeKind_Modified, watcher->mWatchPath.c_str(),dir.c_str(), NULL);
 				}
 
-				// There might be a case where there are odd number of renames A -> B -> C
-				// so don't delete just update the entry and mark as handled
-				*valPtr = absFilePath;
-				handledRenameIds.Add(fileID);
+				renamedItems.Remove(fileID);
 			}
+		}
+
+		if (flags & (
+			kFSEventStreamEventFlagItemInodeMetaMod |
+			kFSEventStreamEventFlagItemModified |
+			kFSEventStreamEventFlagItemXattrMod |
+			kFSEventStreamEventFlagItemFinderInfoMod |
+			kFSEventStreamEventFlagItemChangeOwner))
+		{
+			watcher->mDirectoryChangeFunc(watcher, watcher->mUserData, BfpFileChangeKind_Modified, watcher->mWatchPath.c_str(),relativeFilePath.c_str(), NULL);
 		}
 	}
 
 	// Moved to/from outside
 	for (const auto& kv : renamedItems)
 	{
-		struct stat buffer;
-		bool exists = (stat(kv.mValue.mPath.c_str(), &buffer) == 0);
-		String relativeFilePath = GetRelativePath(kv.mValue.mPath, watcher->mAbsPath);
+		bool exists = CheckPathExists(kv.mValue.c_str());
+		String relativeFilePath = GetRelativePath(kv.mValue, watcher->mAbsPath);
 		String relativeDirectoryPath = GetFileDir(relativeFilePath);
 		watcher->mDirectoryChangeFunc(watcher, watcher->mUserData, (exists ? BfpFileChangeKind_Added : BfpFileChangeKind_Removed), watcher->mWatchPath.c_str(),relativeFilePath.c_str(), NULL);
 		if (!relativeDirectoryPath.empty())
@@ -298,7 +308,10 @@ public:
 	CFRunLoopRef mRunLoopRef;
 	CritSect mCritSect;
 	SyncEvent mWatcherReadyEvent;
+	CFRunLoopSourceRef mExitSource;
+
 	std::atomic<bool> mShouldExit;
+
 
 public:
 	FsEventFileWatchManager() :
@@ -307,6 +320,7 @@ public:
 		mWatcherThread(NULL),
 		mRunLoopRef(NULL),
 		mWatcherReadyEvent(true, false),
+		mExitSource(NULL),
 		mShouldExit(true)
 	{
 	}
@@ -322,15 +336,13 @@ public:
     void WorkerThreadProc();
 };
 
-static void keepalive_perform(void*) {}
-
 void FsEventFileWatchManager::WorkerThreadProc()
 {
 	mRunLoopRef = bf_CFRunLoopGetCurrent();
 
 	// Create dummy source so CFRunLoopRun does not exit if there is are no file watchers active
 	CFRunLoopSourceContext ctx = { };
-	ctx.perform = keepalive_perform;
+	ctx.perform = [](void*) {};
 	CFRunLoopSourceRef keepAliveSource = bf_CFRunLoopSourceCreate(*bf_kCFAllocatorDefault, 0, &ctx);
 	bf_CFRunLoopAddSource(mRunLoopRef, keepAliveSource, *bf_kCFRunLoopDefaultMode);
 	mWatcherReadyEvent.Set();
@@ -340,21 +352,11 @@ void FsEventFileWatchManager::WorkerThreadProc()
 		bf_CFRunLoopRun();
 	}
 
+	AutoCrit critsect(mCritSect);
 	bf_CFRunLoopRemoveSource(mRunLoopRef, keepAliveSource, *bf_kCFRunLoopDefaultMode);
 	bf_CFRunLoopSourceInvalidate(keepAliveSource);
 	bf_CFRelease(keepAliveSource);
-
-	{
-		AutoCrit critsect(mCritSect);
-		mRunLoopRef = NULL;
-	}
-
-	// drain anything enqueued before that
-	// for (int i = 100; i > 0; i--)
-	// {
-	// 	if (bf_CFRunLoopRunInMode(*bf_kCFRunLoopDefaultMode, 0, false) != kCFRunLoopRunFinished)
-	// 		break;
-	// }
+	mRunLoopRef = NULL;
 }
 
 static void WatcherWorkThreadThunk(void* userData)
@@ -444,45 +446,64 @@ void FsEventFileWatchManager::Shutdown()
 	{
 		AutoCrit critsect(mCritSect);
 
-		mShouldExit.store(true);
+		if (mWatcherThread)
+			mWatcherReadyEvent.WaitFor();
+
 		if (mRunLoopRef != NULL)
 		{
-			bf_CFRunLoopStop(mRunLoopRef);
+			CFRunLoopSourceContext exitCtx = { };
+			exitCtx.info = this;
+			exitCtx.perform = [](void* p) {
+				auto watchManager = ((FsEventFileWatchManager*)p);
+				watchManager->mShouldExit.store(true);
+				bf_CFRunLoopSourceInvalidate(watchManager->mExitSource);
+
+				bf_CFRunLoopStop(watchManager->mRunLoopRef);
+			};
+			mExitSource = bf_CFRunLoopSourceCreate(*bf_kCFAllocatorDefault, 0, &exitCtx);
+			bf_CFRunLoopAddSource(mRunLoopRef, mExitSource, *bf_kCFRunLoopDefaultMode);
+
+			// Shutdown:
+			bf_CFRunLoopSourceSignal(mExitSource);
+			bf_CFRunLoopWakeUp(mRunLoopRef);
 		}
 	}
 
 
-	bool doUnload = true;
 	if (mWatcherThread != NULL)
 	{
-		doUnload = BfpThread_WaitFor(mWatcherThread, 1000);
+		mShouldExit.store(true);
+		BfpThread_WaitFor(mWatcherThread, -1);
 		BfpThread_Release(mWatcherThread);
 		mWatcherThread = NULL;
 	}
 
-	if (doUnload)
+	if (mExitSource != NULL)
 	{
-		if (bf_CFRelease)
-		{
-			if (bf_kFSEventStreamEventExtendedDataPathKey)
-					bf_CFRelease(bf_kFSEventStreamEventExtendedDataPathKey);
-			bf_kFSEventStreamEventExtendedDataPathKey = NULL;
-
-			if (bf_kFSEventStreamEventExtendedFileIDKey)
-				bf_CFRelease(bf_kFSEventStreamEventExtendedFileIDKey);
-			bf_kFSEventStreamEventExtendedFileIDKey = NULL;
-		}
-
-		if (mCoreFoundationLib != NULL)
-			dlclose(mCoreFoundationLib);
-
-		mCoreFoundationLib = NULL;
-
-		if (mCoreServicesLib)
-			dlclose(mCoreServicesLib);
-
-		mCoreServicesLib = NULL;
+		bf_CFRelease(mExitSource);
+		mExitSource = NULL;
 	}
+
+	if (bf_CFRelease)
+	{
+		if (bf_kFSEventStreamEventExtendedDataPathKey)
+			bf_CFRelease(bf_kFSEventStreamEventExtendedDataPathKey);
+		bf_kFSEventStreamEventExtendedDataPathKey = NULL;
+
+		if (bf_kFSEventStreamEventExtendedFileIDKey)
+			bf_CFRelease(bf_kFSEventStreamEventExtendedFileIDKey);
+		bf_kFSEventStreamEventExtendedFileIDKey = NULL;
+	}
+
+	if (mCoreFoundationLib != NULL)
+		dlclose(mCoreFoundationLib);
+
+	mCoreFoundationLib = NULL;
+
+	if (mCoreServicesLib)
+		dlclose(mCoreServicesLib);
+
+	mCoreServicesLib = NULL;
 }
 
 BfpFileWatcher* FsEventFileWatchManager::WatchDirectory(const char* path, BfpDirectoryChangeFunc callback, BfpFileWatcherFlags flags, void* userData, BfpFileResult* outResult)
@@ -561,23 +582,11 @@ struct BfpFileWatcherRemoveInfo
 	}
 };
 
-static void WatcherRemovePerform(void* context)
-{
-	BfpFileWatcherRemoveInfo* info = (BfpFileWatcherRemoveInfo*)context;
-
-	bf_FSEventStreamStop(info->mFileWatcher->mStreamRef);
-	bf_FSEventStreamInvalidate(info->mFileWatcher->mStreamRef);
-	bf_FSEventStreamRelease(info->mFileWatcher->mStreamRef);
-	delete info->mFileWatcher;
-	bf_CFRunLoopSourceInvalidate(info->mSource);
-	info->mWatcherDeletedEvent.Set();
-}
-
 void FsEventFileWatchManager::Remove(BfpFileWatcher* watcher)
 {
 	AutoCrit critsect(mCritSect);
 
-	if (mShouldExit.load())
+	if (mRunLoopRef == NULL)
 	{
 		bf_FSEventStreamStop(watcher->mStreamRef);
 		bf_FSEventStreamInvalidate(watcher->mStreamRef);
@@ -591,7 +600,17 @@ void FsEventFileWatchManager::Remove(BfpFileWatcher* watcher)
 
 		CFRunLoopSourceContext removeCtx = { };
 		removeCtx.info = &removeInfo;
-		removeCtx.perform = WatcherRemovePerform;
+		removeCtx.perform = [](void* context)
+		{
+			BfpFileWatcherRemoveInfo* info = (BfpFileWatcherRemoveInfo*)context;
+
+			bf_FSEventStreamStop(info->mFileWatcher->mStreamRef);
+			bf_FSEventStreamInvalidate(info->mFileWatcher->mStreamRef);
+			bf_FSEventStreamRelease(info->mFileWatcher->mStreamRef);
+			delete info->mFileWatcher;
+			bf_CFRunLoopSourceInvalidate(info->mSource);
+			info->mWatcherDeletedEvent.Set();
+		};
 
 		removeInfo.mSource = bf_CFRunLoopSourceCreate(*bf_kCFAllocatorDefault, 0, &removeCtx);
 
