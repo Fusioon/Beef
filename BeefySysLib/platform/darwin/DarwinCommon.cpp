@@ -1,4 +1,4 @@
-#include <execinfo.h>
+;#include <execinfo.h>
 #include <sys/sysctl.h>
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
@@ -22,7 +22,16 @@ char* itoa(int value, char* str, int base)
 #ifdef BFP_HAS_FILEWATCHER
 
 #include <CoreServices/CoreServices.h>
-#include <atomic>
+
+static void* gCoreFoundationLib = NULL;
+static void* gCoreServicesLib = NULL;
+
+// libdispatch Function Pointers
+
+static dispatch_queue_t (*bf_dispatch_queue_create)(const char* label, void* attr) = NULL;
+static void (*bf_dispatch_async_f)(dispatch_queue_t queue, void* context, dispatch_function_t work) = NULL;
+static void (*bf_dispatch_sync_f)(dispatch_queue_t queue, void* context, dispatch_function_t work) = NULL;
+static void (*bf_dispatch_release)(void* object) = NULL;
 
 // FSEvents Function Pointers
 static FSEventStreamRef (*bf_FSEventStreamCreate)(
@@ -34,12 +43,7 @@ static FSEventStreamRef (*bf_FSEventStreamCreate)(
 	CFTimeInterval latency,
 	FSEventStreamCreateFlags flags
 ) = NULL;
-
-static void (*bf_FSEventStreamScheduleWithRunLoop)(
-	FSEventStreamRef streamRef,
-	CFRunLoopRef runLoop,
-	CFStringRef runLoopMode
-) = NULL;
+static void (*bf_FSEventStreamSetDispatchQueue)(FSEventStreamRef streamRef, dispatch_queue_t q) = NULL;
 
 static Boolean (*bf_FSEventStreamStart)(FSEventStreamRef streamRef) = NULL;
 static void (*bf_FSEventStreamStop)(FSEventStreamRef streamRef) = NULL;
@@ -56,30 +60,29 @@ static const void* (*bf_CFDictionaryGetValue)(CFDictionaryRef theDict, const voi
 static const char* (*bf_CFStringGetCStringPtr)(CFStringRef theString, CFStringEncoding encoding) = NULL;
 static Boolean (*bf_CFStringGetCString)(CFStringRef theString, char *buffer, CFIndex bufferSize, CFStringEncoding encoding) = NULL;
 static Boolean (*bf_CFNumberGetValue)(CFNumberRef number, CFNumberType theType, void *valuePtr) = NULL;
-static CFRunLoopRef (*bf_CFRunLoopGetCurrent)(void) = NULL;
-static void (*bf_CFRunLoopRun)(void) = NULL;
-static void (*bf_CFRunLoopStop)(CFRunLoopRef rl) = NULL;
 static CFStringRef (*bf_CFStringCreateWithCString)(CFAllocatorRef alloc, const char *cStr, CFStringEncoding encoding) = NULL;
 static CFArrayRef (*bf_CFArrayCreate)(CFAllocatorRef allocator, const void **values, CFIndex numValues, const CFArrayCallBacks *callBacks) = NULL;
-static void (*bf_CFRunLoopWakeUp)(CFRunLoopRef rl) = NULL;
 static void (*bf_CFRelease)(CFTypeRef cf) = NULL;
-static CFRunLoopSourceRef (*bf_CFRunLoopSourceCreate)(CFAllocatorRef allocator, CFIndex order, CFRunLoopSourceContext *context) = NULL;
-static void (*bf_CFRunLoopAddSource)(CFRunLoopRef rl, CFRunLoopSourceRef source, CFRunLoopMode mode) = NULL;
-static void (*bf_CFRunLoopRemoveSource)(CFRunLoopRef rl, CFRunLoopSourceRef source, CFRunLoopMode mode) = NULL;
-static void (*bf_CFRunLoopSourceInvalidate)(CFRunLoopSourceRef source) = NULL;
-static void (*bf_CFRunLoopSourceSignal)(CFRunLoopSourceRef source) = NULL;
-
-// CoreFoundation Exported Constants
-static CFAllocatorRef* bf_kCFAllocatorDefault = NULL;
-static CFStringRef* bf_kCFRunLoopDefaultMode = NULL;
 
 struct BfpFileWatcher
 {
-	String mWatchPath;
-	String mAbsPath;
-	BfpDirectoryChangeFunc mDirectoryChangeFunc;
-	FSEventStreamRef mStreamRef;
-	void* mUserData;
+	String					mWatchPath;
+	String					mAbsPath;
+	BfpDirectoryChangeFunc	mDirectoryChangeFunc;
+	FSEventStreamRef		mStreamRef;
+	void*					mUserData;
+	dispatch_queue_t		mDispatchQueue;
+
+	void ReleaseStream()
+	{
+		if (mStreamRef == NULL)
+			return;
+
+		bf_FSEventStreamStop(mStreamRef);
+		bf_FSEventStreamInvalidate(mStreamRef);
+		bf_FSEventStreamRelease(mStreamRef);
+		mStreamRef = NULL;
+	}
 };
 
 static bool CheckPathExists(const char* path)
@@ -111,7 +114,7 @@ static void FSEventsCallback(
 	{
 		FSEventStreamEventFlags flags = eventFlags[i];
 
-		if (flags & kFSEventStreamEventFlagRootChanged)
+		if (flags & (kFSEventStreamEventFlagRootChanged | kFSEventStreamEventFlagUnmount | kFSEventStreamEventFlagMount))
 		{
 			watcher->mAbsPath.clear();
 
@@ -119,6 +122,8 @@ static void FSEventsCallback(
 			if (newAbsPath != NULL)
 				watcher->mAbsPath = newAbsPath;
 			free(newAbsPath);
+
+			watcher->mDirectoryChangeFunc(watcher, watcher->mUserData, BfpFileChangeKind_Failed, watcher->mWatchPath.c_str(),NULL, NULL);
 			continue;
 		}
 
@@ -127,9 +132,9 @@ static void FSEventsCallback(
 
 		CFDictionaryRef dict = static_cast<CFDictionaryRef>(bf_CFArrayGetValueAtIndex(dictArray, i));
 
-		CFStringRef pathCF = static_cast<CFStringRef>(
-			bf_CFDictionaryGetValue(dict, bf_kFSEventStreamEventExtendedDataPathKey)
-		);
+		CFStringRef pathCF = (CFStringRef)bf_CFDictionaryGetValue(dict, bf_kFSEventStreamEventExtendedDataPathKey);
+		if (pathCF == NULL)
+			continue;
 
 		const char* path = bf_CFStringGetCStringPtr(pathCF, kCFStringEncodingUTF8);
 		if (path == NULL)
@@ -185,23 +190,13 @@ static void FSEventsCallback(
 				flags &= ~(kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemCloned);
 		}
 
-		if (flags & (kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemCloned))
+		if (flags & kFSEventStreamEventFlagItemRenamed)
 		{
-			watcher->mDirectoryChangeFunc(watcher, watcher->mUserData, BfpFileChangeKind_Added, watcher->mWatchPath.c_str(),relativeFilePath.c_str(), NULL);
-			if (!relativeDirectoryPath.empty())
-				watcher->mDirectoryChangeFunc(watcher, watcher->mUserData, BfpFileChangeKind_Modified, watcher->mWatchPath.c_str(),relativeDirectoryPath.c_str(), NULL);
-		}
-		else if (flags & kFSEventStreamEventFlagItemRemoved)
-		{
-			watcher->mDirectoryChangeFunc(watcher, watcher->mUserData, BfpFileChangeKind_Removed, watcher->mWatchPath.c_str(),relativeFilePath.c_str(), NULL);
-			if (!relativeDirectoryPath.empty())
-				watcher->mDirectoryChangeFunc(watcher, watcher->mUserData, BfpFileChangeKind_Modified, watcher->mWatchPath.c_str(),relativeDirectoryPath.c_str(), NULL);
-		}
-		else if (flags & kFSEventStreamEventFlagItemRenamed)
-		{
-			CFNumberRef fileIDCF = static_cast<CFNumberRef>(
-				bf_CFDictionaryGetValue(dict, bf_kFSEventStreamEventExtendedFileIDKey)
-			);
+			CFNumberRef fileIDCF = (CFNumberRef)bf_CFDictionaryGetValue(dict, bf_kFSEventStreamEventExtendedFileIDKey);
+
+			if (fileIDCF == NULL)
+				continue;
+
 			uint64_t fileID = 0;
 			bf_CFNumberGetValue(fileIDCF, kCFNumberLongLongType, &fileID);
 
@@ -273,6 +268,21 @@ static void FSEventsCallback(
 
 				renamedItems.Remove(fileID);
 			}
+
+			continue;
+		}
+
+		if (flags & (kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemCloned))
+		{
+			watcher->mDirectoryChangeFunc(watcher, watcher->mUserData, BfpFileChangeKind_Added, watcher->mWatchPath.c_str(),relativeFilePath.c_str(), NULL);
+			if (!relativeDirectoryPath.empty())
+				watcher->mDirectoryChangeFunc(watcher, watcher->mUserData, BfpFileChangeKind_Modified, watcher->mWatchPath.c_str(),relativeDirectoryPath.c_str(), NULL);
+		}
+		else if (flags & kFSEventStreamEventFlagItemRemoved)
+		{
+			watcher->mDirectoryChangeFunc(watcher, watcher->mUserData, BfpFileChangeKind_Removed, watcher->mWatchPath.c_str(),relativeFilePath.c_str(), NULL);
+			if (!relativeDirectoryPath.empty())
+				watcher->mDirectoryChangeFunc(watcher, watcher->mUserData, BfpFileChangeKind_Modified, watcher->mWatchPath.c_str(),relativeDirectoryPath.c_str(), NULL);
 		}
 
 		if (flags & (
@@ -299,30 +309,31 @@ static void FSEventsCallback(
 
 }
 
+template <bool queueDelete>
+static void DestroyWatcherOnQueue(void* param)
+{
+	BfpFileWatcher* watcher = (BfpFileWatcher*)param;
+	watcher->ReleaseStream();
+	// Has to be queued as there might be events that were enqueued before we released the stream
+	// and they will try to read watcher data
+	if (queueDelete)
+	{
+		bf_dispatch_async_f(watcher->mDispatchQueue, watcher, [](void* data) {
+			delete ((BfpFileWatcher*)data);
+		});
+	}
+}
+
 class FsEventFileWatchManager : public FileWatchManager
 {
 public:
-	void* mCoreFoundationLib;
-	void* mCoreServicesLib;
-	BfpThread* mWatcherThread;
-	CFRunLoopRef mRunLoopRef;
-	CritSect mCritSect;
-	SyncEvent mWatcherReadyEvent;
-	CFRunLoopSourceRef mExitSource;
-
-	std::atomic<bool> mShouldExit;
-
-
+	Array<BfpFileWatcher*>	mWatchers;
+	CritSect				mCritSect;
+	bool					mInitialized;
 public:
-	FsEventFileWatchManager() :
-		mCoreFoundationLib(NULL),
-		mCoreServicesLib(NULL),
-		mWatcherThread(NULL),
-		mRunLoopRef(NULL),
-		mWatcherReadyEvent(true, false),
-		mExitSource(NULL),
-		mShouldExit(true)
+	FsEventFileWatchManager()
 	{
+		mInitialized = false;
 	}
 
     bool Init() override;
@@ -333,53 +344,29 @@ public:
 
     void Remove(BfpFileWatcher *watcher) override;
 
-    void WorkerThreadProc();
 };
-
-void FsEventFileWatchManager::WorkerThreadProc()
-{
-	mRunLoopRef = bf_CFRunLoopGetCurrent();
-
-	// Create dummy source so CFRunLoopRun does not exit if there is are no file watchers active
-	CFRunLoopSourceContext ctx = { };
-	ctx.perform = [](void*) {};
-	CFRunLoopSourceRef keepAliveSource = bf_CFRunLoopSourceCreate(*bf_kCFAllocatorDefault, 0, &ctx);
-	bf_CFRunLoopAddSource(mRunLoopRef, keepAliveSource, *bf_kCFRunLoopDefaultMode);
-	mWatcherReadyEvent.Set();
-
-	while (!mShouldExit.load())
-	{
-		bf_CFRunLoopRun();
-	}
-
-	AutoCrit critsect(mCritSect);
-	bf_CFRunLoopRemoveSource(mRunLoopRef, keepAliveSource, *bf_kCFRunLoopDefaultMode);
-	bf_CFRunLoopSourceInvalidate(keepAliveSource);
-	bf_CFRelease(keepAliveSource);
-	mRunLoopRef = NULL;
-}
-
-static void WatcherWorkThreadThunk(void* userData)
-{
-    ((FsEventFileWatchManager*)userData)->WorkerThreadProc();
-}
 
 bool FsEventFileWatchManager::Init()
 {
-	AutoCrit critsect(mCritSect);
+	AutoCrit autoCrit(mCritSect);
 
-	mCoreFoundationLib = dlopen("/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation", RTLD_LAZY);
-	mCoreServicesLib = dlopen("/System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices", RTLD_LAZY);
-	if ((mCoreFoundationLib == NULL) || (mCoreServicesLib == NULL) )
+	gCoreFoundationLib = dlopen("/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation", RTLD_LAZY);
+	gCoreServicesLib = dlopen("/System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices", RTLD_LAZY);
+	if ((gCoreFoundationLib == NULL) || (gCoreServicesLib == NULL) )
 	{
-		// Set event so we don't lock in WatchDirectory
-		mWatcherReadyEvent.Set();
 		return false;
 	}
 
 	bool symbolsLoaded = true;
 
-#define BF_CF_GET_SYM(name) (symbolsLoaded &= (bf_##name = (decltype(bf_##name))dlsym(mCoreFoundationLib, #name)) != NULL)
+#define BF_DP_GET_SYM(name) (symbolsLoaded &= (bf_##name = (decltype(bf_##name))dlsym(RTLD_DEFAULT, #name)) != NULL)
+	BF_DP_GET_SYM(dispatch_queue_create);
+	BF_DP_GET_SYM(dispatch_async_f);
+	BF_DP_GET_SYM(dispatch_sync_f);
+	BF_DP_GET_SYM(dispatch_release);
+#undef BF_DP_GET_SYM
+
+#define BF_CF_GET_SYM(name) (symbolsLoaded &= (bf_##name = (decltype(bf_##name))dlsym(gCoreFoundationLib, #name)) != NULL)
 
 	// Resolve CoreFoundation functions
 	BF_CF_GET_SYM(CFArrayGetValueAtIndex);
@@ -387,31 +374,18 @@ bool FsEventFileWatchManager::Init()
 	BF_CF_GET_SYM(CFStringGetCStringPtr);
 	BF_CF_GET_SYM(CFStringGetCString);
 	BF_CF_GET_SYM(CFNumberGetValue);
-	BF_CF_GET_SYM(CFRunLoopGetCurrent);
-	BF_CF_GET_SYM(CFRunLoopRun);
-	BF_CF_GET_SYM(CFRunLoopStop);
 	BF_CF_GET_SYM(CFStringCreateWithCString);
 	BF_CF_GET_SYM(CFArrayCreate);
-	BF_CF_GET_SYM(CFRunLoopWakeUp);
 	BF_CF_GET_SYM(CFRelease);
-	BF_CF_GET_SYM(CFRunLoopSourceCreate);
-	BF_CF_GET_SYM(CFRunLoopAddSource);
-	BF_CF_GET_SYM(CFRunLoopRemoveSource);
-	BF_CF_GET_SYM(CFRunLoopSourceInvalidate);
-	BF_CF_GET_SYM(CFRunLoopSourceSignal);
-
-	// Resolve CoreFoundation exported constants
-	BF_CF_GET_SYM(kCFAllocatorDefault);
-	BF_CF_GET_SYM(kCFRunLoopDefaultMode);
 
 #undef BF_CF_GET_SYM
 
 
-#define BF_CS_GET_SYM(name) (symbolsLoaded &= (bf_##name = (decltype(bf_##name))dlsym(mCoreServicesLib, #name)) != NULL)
+#define BF_CS_GET_SYM(name) (symbolsLoaded &= (bf_##name = (decltype(bf_##name))dlsym(gCoreServicesLib, #name)) != NULL)
 
 	// Resolve CoreServices functions
 	BF_CS_GET_SYM(FSEventStreamCreate);
-	BF_CS_GET_SYM(FSEventStreamScheduleWithRunLoop);
+	BF_CS_GET_SYM(FSEventStreamSetDispatchQueue);
 	BF_CS_GET_SYM(FSEventStreamStart);
 	BF_CS_GET_SYM(FSEventStreamStop);
 	BF_CS_GET_SYM(FSEventStreamInvalidate);
@@ -421,67 +395,45 @@ bool FsEventFileWatchManager::Init()
 
 	if (!symbolsLoaded)
 	{
-		mWatcherReadyEvent.Set();
 		return false;
 	}
 
-	// Create constants, cannot resolve from library
+	// Create constants, these are not exported so cannot resolve from library
 
-	bf_kFSEventStreamEventExtendedDataPathKey = bf_CFStringCreateWithCString(*bf_kCFAllocatorDefault, "path", kCFStringEncodingUTF8);
-	bf_kFSEventStreamEventExtendedFileIDKey = bf_CFStringCreateWithCString(*bf_kCFAllocatorDefault, "fileID", kCFStringEncodingUTF8);
+#define BF_CREATE_CONST_STR(name, value) (symbolsLoaded &= (bf_##name = bf_CFStringCreateWithCString(NULL, value, kCFStringEncodingUTF8)) != NULL)
 
-	mShouldExit.store(false);
-    mWatcherThread = BfpThread_Create(&WatcherWorkThreadThunk, this);
-    if (mWatcherThread == NULL)
-    {
-    	mWatcherReadyEvent.Set();
-	    return false;
-    }
+	BF_CREATE_CONST_STR(kFSEventStreamEventExtendedDataPathKey, "path");
+	BF_CREATE_CONST_STR(kFSEventStreamEventExtendedFileIDKey, "fileID");
 
+#undef BF_CREATE_CONST_STR
+
+	if (!symbolsLoaded)
+		return false;
+
+	mInitialized = true;
 	return true;
 }
 
 void FsEventFileWatchManager::Shutdown()
 {
+	Array<BfpFileWatcher*> watchersToRelease;
 	{
-		AutoCrit critsect(mCritSect);
+		AutoCrit autoCrit(mCritSect);
+		if (!mInitialized)
+			return;
 
-		if (mWatcherThread)
-			mWatcherReadyEvent.WaitFor();
-
-		if (mRunLoopRef != NULL)
-		{
-			CFRunLoopSourceContext exitCtx = { };
-			exitCtx.info = this;
-			exitCtx.perform = [](void* p) {
-				auto watchManager = ((FsEventFileWatchManager*)p);
-				watchManager->mShouldExit.store(true);
-				bf_CFRunLoopSourceInvalidate(watchManager->mExitSource);
-
-				bf_CFRunLoopStop(watchManager->mRunLoopRef);
-			};
-			mExitSource = bf_CFRunLoopSourceCreate(*bf_kCFAllocatorDefault, 0, &exitCtx);
-			bf_CFRunLoopAddSource(mRunLoopRef, mExitSource, *bf_kCFRunLoopDefaultMode);
-
-			// Shutdown:
-			bf_CFRunLoopSourceSignal(mExitSource);
-			bf_CFRunLoopWakeUp(mRunLoopRef);
-		}
+		watchersToRelease = std::move(mWatchers);
 	}
 
+	for (const auto& watcher : watchersToRelease)
+		bf_dispatch_async_f(watcher->mDispatchQueue, watcher, &DestroyWatcherOnQueue<false>);
 
-	if (mWatcherThread != NULL)
+	for (const auto& watcher : watchersToRelease)
 	{
-		mShouldExit.store(true);
-		BfpThread_WaitFor(mWatcherThread, -1);
-		BfpThread_Release(mWatcherThread);
-		mWatcherThread = NULL;
-	}
-
-	if (mExitSource != NULL)
-	{
-		bf_CFRelease(mExitSource);
-		mExitSource = NULL;
+		// Drain barrier: on a serial queue this returns only once every block has completed
+		bf_dispatch_sync_f(watcher->mDispatchQueue, NULL, [](void*) {});
+		bf_dispatch_release(watcher->mDispatchQueue);
+		delete watcher;
 	}
 
 	if (bf_CFRelease)
@@ -494,24 +446,13 @@ void FsEventFileWatchManager::Shutdown()
 			bf_CFRelease(bf_kFSEventStreamEventExtendedFileIDKey);
 		bf_kFSEventStreamEventExtendedFileIDKey = NULL;
 	}
-
-	if (mCoreFoundationLib != NULL)
-		dlclose(mCoreFoundationLib);
-
-	mCoreFoundationLib = NULL;
-
-	if (mCoreServicesLib)
-		dlclose(mCoreServicesLib);
-
-	mCoreServicesLib = NULL;
 }
 
 BfpFileWatcher* FsEventFileWatchManager::WatchDirectory(const char* path, BfpDirectoryChangeFunc callback, BfpFileWatcherFlags flags, void* userData, BfpFileResult* outResult)
 {
-	mWatcherReadyEvent.WaitFor();
+	AutoCrit autoCrit(mCritSect);
 
-	AutoCrit critsect(mCritSect);
-	if (mRunLoopRef == NULL)
+	if (!mInitialized)
 	{
 		OUTRESULT(BfpFileResult_UnknownError);
 		return NULL;
@@ -523,25 +464,34 @@ BfpFileWatcher* FsEventFileWatchManager::WatchDirectory(const char* path, BfpDir
 		OUTRESULT(BfpFileResult_NotFound);
 		return NULL;
 	}
+	defer ( free(absPath) );
 
-	CFStringRef mypath = bf_CFStringCreateWithCString(*bf_kCFAllocatorDefault, path, kCFStringEncodingUTF8);
-    CFArrayRef pathsToWatch = bf_CFArrayCreate(NULL, (const void **)&mypath, 1, NULL);
-	defer(
-		bf_CFRelease(mypath);
-		bf_CFRelease(pathsToWatch);
-	);
+	CFStringRef pathString = bf_CFStringCreateWithCString(NULL, absPath, kCFStringEncodingUTF8);
+	if (pathString == NULL)
+	{
+		OUTRESULT(BfpFileResult_UnknownError);
+		return NULL;
+	}
+	defer( bf_CFRelease(pathString) );
+
+    CFArrayRef pathsToWatch = bf_CFArrayCreate(NULL, (const void **)&pathString, 1, NULL);
+	if (pathsToWatch == NULL)
+	{
+		OUTRESULT(BfpFileResult_UnknownError);
+		return NULL;
+	}
+	defer( bf_CFRelease(pathsToWatch) );
 
 	BfpFileWatcher* pFileWatcher = new BfpFileWatcher();
 	pFileWatcher->mWatchPath = path;
 	pFileWatcher->mAbsPath = absPath;
-	free(absPath);
 	pFileWatcher->mDirectoryChangeFunc = callback;
 	pFileWatcher->mUserData = userData;
 
     FSEventStreamContext context = { };
 	context.info = pFileWatcher;
     pFileWatcher->mStreamRef = bf_FSEventStreamCreate(
-        *bf_kCFAllocatorDefault,
+        NULL,
         ((flags & BfpFileWatcherFlag_IncludeSubdirectories) != 0 ? &FSEventsCallback<false> : &FSEventsCallback<true>),
         &context,
         pathsToWatch,
@@ -551,75 +501,50 @@ BfpFileWatcher* FsEventFileWatchManager::WatchDirectory(const char* path, BfpDir
         kFSEventStreamCreateFlagUseExtendedData | kFSEventStreamCreateFlagUseCFTypes
     );
 
-    // Attach the new stream to the BACKGROUND thread's Run Loop
-    bf_FSEventStreamScheduleWithRunLoop(pFileWatcher->mStreamRef, mRunLoopRef, *bf_kCFRunLoopDefaultMode);
+	if (pFileWatcher->mStreamRef == NULL)
+	{
+		delete pFileWatcher;
+		OUTRESULT(BfpFileResult_UnknownError);
+		return NULL;
+	}
+
+	pFileWatcher->mDispatchQueue = bf_dispatch_queue_create("com.beef.filewatcher", NULL);
+	if (pFileWatcher->mDispatchQueue == NULL)
+	{
+		delete pFileWatcher;
+		OUTRESULT(BfpFileResult_UnknownError);
+		return NULL;
+	}
+
+	bf_FSEventStreamSetDispatchQueue(pFileWatcher->mStreamRef, pFileWatcher->mDispatchQueue);
     if (!bf_FSEventStreamStart(pFileWatcher->mStreamRef))
     {
     	bf_FSEventStreamInvalidate(pFileWatcher->mStreamRef);
     	bf_FSEventStreamRelease(pFileWatcher->mStreamRef);
+    	bf_dispatch_release(pFileWatcher->mDispatchQueue);
 	    delete pFileWatcher;
     	OUTRESULT(BfpFileResult_UnknownError);
     	return NULL;
     }
-    bf_CFRunLoopWakeUp(mRunLoopRef);
 
+	mWatchers.Add(pFileWatcher);
 	OUTRESULT(BfpFileResult_Ok);
 	return pFileWatcher;
 }
 
-struct BfpFileWatcherRemoveInfo
-{
-	SyncEvent mWatcherDeletedEvent;
-	BfpFileWatcher* mFileWatcher;
-	CFRunLoopSourceRef mSource;
-
-	BfpFileWatcherRemoveInfo() :
-		mWatcherDeletedEvent(true, false),
-		mFileWatcher(NULL),
-		mSource(NULL)
-	{
-
-	}
-};
-
 void FsEventFileWatchManager::Remove(BfpFileWatcher* watcher)
 {
-	AutoCrit critsect(mCritSect);
-
-	if (mRunLoopRef == NULL)
+	bool removed;
 	{
-		bf_FSEventStreamStop(watcher->mStreamRef);
-		bf_FSEventStreamInvalidate(watcher->mStreamRef);
-		bf_FSEventStreamRelease(watcher->mStreamRef);
-		delete watcher;
+		AutoCrit autoCrit(mCritSect);
+		removed = mWatchers.Remove(watcher);
 	}
-	else
+
+	if (removed)
 	{
-		BfpFileWatcherRemoveInfo removeInfo;
-		removeInfo.mFileWatcher = watcher;
-
-		CFRunLoopSourceContext removeCtx = { };
-		removeCtx.info = &removeInfo;
-		removeCtx.perform = [](void* context)
-		{
-			BfpFileWatcherRemoveInfo* info = (BfpFileWatcherRemoveInfo*)context;
-
-			bf_FSEventStreamStop(info->mFileWatcher->mStreamRef);
-			bf_FSEventStreamInvalidate(info->mFileWatcher->mStreamRef);
-			bf_FSEventStreamRelease(info->mFileWatcher->mStreamRef);
-			delete info->mFileWatcher;
-			bf_CFRunLoopSourceInvalidate(info->mSource);
-			info->mWatcherDeletedEvent.Set();
-		};
-
-		removeInfo.mSource = bf_CFRunLoopSourceCreate(*bf_kCFAllocatorDefault, 0, &removeCtx);
-
-		bf_CFRunLoopAddSource(mRunLoopRef, removeInfo.mSource, *bf_kCFRunLoopDefaultMode);
-		bf_CFRunLoopSourceSignal(removeInfo.mSource);
-		bf_CFRunLoopWakeUp(mRunLoopRef);
-
-		removeInfo.mWatcherDeletedEvent.WaitFor();
-		bf_CFRelease(removeInfo.mSource);
+		dispatch_queue_t dispatchQueue = watcher->mDispatchQueue;
+		bf_dispatch_sync_f(watcher->mDispatchQueue, watcher, &DestroyWatcherOnQueue<true>);
+		bf_dispatch_release(dispatchQueue);
 	}
 }
 
