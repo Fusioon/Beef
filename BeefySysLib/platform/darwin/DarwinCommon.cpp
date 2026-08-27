@@ -1,4 +1,4 @@
-;#include <execinfo.h>
+#include <execinfo.h>
 #include <sys/sysctl.h>
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
@@ -319,7 +319,10 @@ static void DestroyWatcherOnQueue(void* param)
 	if (queueDelete)
 	{
 		bf_dispatch_async_f(watcher->mDispatchQueue, watcher, [](void* data) {
-			delete ((BfpFileWatcher*)data);
+			BfpFileWatcher* watcher = (BfpFileWatcher*)data;
+			dispatch_queue_t queue = watcher->mDispatchQueue;
+			delete watcher;
+			bf_dispatch_release(queue);
 		});
 	}
 }
@@ -422,6 +425,8 @@ void FsEventFileWatchManager::Shutdown()
 		if (!mInitialized)
 			return;
 
+		mInitialized = false;
+
 		watchersToRelease = std::move(mWatchers);
 	}
 
@@ -436,16 +441,7 @@ void FsEventFileWatchManager::Shutdown()
 		delete watcher;
 	}
 
-	if (bf_CFRelease)
-	{
-		if (bf_kFSEventStreamEventExtendedDataPathKey)
-			bf_CFRelease(bf_kFSEventStreamEventExtendedDataPathKey);
-		bf_kFSEventStreamEventExtendedDataPathKey = NULL;
-
-		if (bf_kFSEventStreamEventExtendedFileIDKey)
-			bf_CFRelease(bf_kFSEventStreamEventExtendedFileIDKey);
-		bf_kFSEventStreamEventExtendedFileIDKey = NULL;
-	}
+	// Leaking constants / dlopen symbols is intentional
 }
 
 BfpFileWatcher* FsEventFileWatchManager::WatchDirectory(const char* path, BfpDirectoryChangeFunc callback, BfpFileWatcherFlags flags, void* userData, BfpFileResult* outResult)
@@ -511,6 +507,7 @@ BfpFileWatcher* FsEventFileWatchManager::WatchDirectory(const char* path, BfpDir
 	pFileWatcher->mDispatchQueue = bf_dispatch_queue_create("com.beef.filewatcher", NULL);
 	if (pFileWatcher->mDispatchQueue == NULL)
 	{
+    	bf_FSEventStreamRelease(pFileWatcher->mStreamRef);
 		delete pFileWatcher;
 		OUTRESULT(BfpFileResult_UnknownError);
 		return NULL;
@@ -534,17 +531,19 @@ BfpFileWatcher* FsEventFileWatchManager::WatchDirectory(const char* path, BfpDir
 
 void FsEventFileWatchManager::Remove(BfpFileWatcher* watcher)
 {
+
 	bool removed;
 	{
 		AutoCrit autoCrit(mCritSect);
 		removed = mWatchers.Remove(watcher);
 	}
 
+	// Events might still be generated for a short while
+	// in this case it's not a problem since beef side has it's own
+	// list of registered watchers
 	if (removed)
 	{
-		dispatch_queue_t dispatchQueue = watcher->mDispatchQueue;
-		bf_dispatch_sync_f(watcher->mDispatchQueue, watcher, &DestroyWatcherOnQueue<true>);
-		bf_dispatch_release(dispatchQueue);
+		bf_dispatch_async_f(watcher->mDispatchQueue, watcher, &DestroyWatcherOnQueue<true>);
 	}
 }
 
