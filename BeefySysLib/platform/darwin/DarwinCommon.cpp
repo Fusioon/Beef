@@ -69,9 +69,9 @@ struct BfpFileWatcher
 	String					mWatchPath;
 	String					mAbsPath;
 	BfpDirectoryChangeFunc	mDirectoryChangeFunc;
-	FSEventStreamRef		mStreamRef;
-	void*					mUserData;
-	dispatch_queue_t		mDispatchQueue;
+	FSEventStreamRef		mStreamRef = NULL;
+	void*					mUserData = NULL;
+	dispatch_queue_t		mDispatchQueue = NULL;
 
 	void ReleaseStream()
 	{
