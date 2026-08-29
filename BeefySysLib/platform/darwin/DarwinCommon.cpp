@@ -19,9 +19,11 @@ char* itoa(int value, char* str, int base)
     return str;
 }
 
+// Needs at least macos 10.13, will crash in callback on earlier version because of kFSEventStreamCreateFlagUseExtendedData
 #ifdef BFP_HAS_FILEWATCHER
 
 #include <CoreServices/CoreServices.h>
+#include <atomic>
 
 static void* gCoreFoundationLib = NULL;
 static void* gCoreServicesLib = NULL;
@@ -69,19 +71,58 @@ struct BfpFileWatcher
 	String					mWatchPath;
 	String					mAbsPath;
 	BfpDirectoryChangeFunc	mDirectoryChangeFunc;
-	FSEventStreamRef		mStreamRef = NULL;
-	void*					mUserData = NULL;
-	dispatch_queue_t		mDispatchQueue = NULL;
+	void*					mUserData;
+
+	FSEventStreamRef		mStreamRef;
+	dispatch_queue_t		mDispatchQueue;
+
+	CritSect				mCritSect;
+	std::atomic<bool>		mShuttingDown;
+	bool					mStarted;
+
+	// Make type non-copyable
+	BfpFileWatcher(const BfpFileWatcher&) = delete;
+	BfpFileWatcher& operator=(const BfpFileWatcher&) = delete;
+
+	BfpFileWatcher() :
+		mDirectoryChangeFunc(NULL),
+		mUserData(NULL),
+		mStreamRef(NULL),
+		mDispatchQueue(NULL),
+		mShuttingDown(false),
+		mStarted(false)
+	{
+	}
+
+	~BfpFileWatcher()
+	{
+		ReleaseStream();
+		ReleaseQueue();
+	}
 
 	void ReleaseStream()
 	{
 		if (mStreamRef == NULL)
 			return;
 
-		bf_FSEventStreamStop(mStreamRef);
+		if (mStarted)
+		{
+			bf_FSEventStreamStop(mStreamRef);
+			mStarted = false;
+		}
+
 		bf_FSEventStreamInvalidate(mStreamRef);
 		bf_FSEventStreamRelease(mStreamRef);
 		mStreamRef = NULL;
+	}
+
+	void ReleaseQueue()
+	{
+		if (mDispatchQueue == NULL)
+			return;
+
+		bf_dispatch_release(mDispatchQueue);
+		mDispatchQueue = NULL;
 	}
 };
 
@@ -102,7 +143,12 @@ static void FSEventsCallback(
     const FSEventStreamEventId eventIds[])
 {
 	BfpFileWatcher* watcher = (BfpFileWatcher*)clientCallBackInfo;
-	CFArrayRef dictArray = static_cast<CFArrayRef>(eventData);
+	if (watcher->mShuttingDown)
+		return;
+
+	AutoCrit autoCrit(watcher->mCritSect);
+
+	CFArrayRef dictArray = (CFArrayRef)(eventData);
 
 	// We do not handle renames across batches as that would needlessly complicate things
 	// if cross batch rename occurs then remove and add is emitted
@@ -110,8 +156,11 @@ static void FSEventsCallback(
 
 	char pathBuffer[PATH_MAX];
 
-	for (CFIndex i = 0; i < numEvents; i++)
+	for (size_t i = 0; i < numEvents; i++)
 	{
+		if (watcher->mShuttingDown)
+			return;
+
 		FSEventStreamEventFlags flags = eventFlags[i];
 
 		if (flags & (kFSEventStreamEventFlagRootChanged | kFSEventStreamEventFlagUnmount | kFSEventStreamEventFlagMount))
@@ -123,14 +172,17 @@ static void FSEventsCallback(
 				watcher->mAbsPath = newAbsPath;
 			free(newAbsPath);
 
-			watcher->mDirectoryChangeFunc(watcher, watcher->mUserData, BfpFileChangeKind_Failed, watcher->mWatchPath.c_str(),NULL, NULL);
+			if ((flags & kFSEventStreamEventFlagMount) == 0)
+			{
+				watcher->mDirectoryChangeFunc(watcher, watcher->mUserData, BfpFileChangeKind_Failed, watcher->mWatchPath.c_str(),NULL, NULL);
+			}
 			continue;
 		}
 
 		if (watcher->mAbsPath.empty())
 			continue;
 
-		CFDictionaryRef dict = static_cast<CFDictionaryRef>(bf_CFArrayGetValueAtIndex(dictArray, i));
+		CFDictionaryRef dict = (CFDictionaryRef)(bf_CFArrayGetValueAtIndex(dictArray, (CFIndex)i));
 
 		CFStringRef pathCF = (CFStringRef)bf_CFDictionaryGetValue(dict, bf_kFSEventStreamEventExtendedDataPathKey);
 		if (pathCF == NULL)
@@ -160,7 +212,7 @@ static void FSEventsCallback(
 			{
 				if (relativeDirectoryPath.IndexOf('/') == -1)
 				{
-					watcher->mDirectoryChangeFunc(watcher, watcher->mUserData, BfpFileChangeKind_Failed, watcher->mWatchPath.c_str(),relativeDirectoryPath.c_str(), NULL);
+					watcher->mDirectoryChangeFunc(watcher, watcher->mUserData, BfpFileChangeKind_Failed, watcher->mWatchPath.c_str(),NULL, NULL);
 				}
 			}
 			else if (flags & (kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemCloned | kFSEventStreamEventFlagItemRemoved))
@@ -176,11 +228,11 @@ static void FSEventsCallback(
 
 		if (flags & (kFSEventStreamEventFlagKernelDropped | kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagMustScanSubDirs))
 		{
-			watcher->mDirectoryChangeFunc(watcher, watcher->mUserData, BfpFileChangeKind_Failed, watcher->mWatchPath.c_str(),relativeFilePath.c_str(), NULL);
+			watcher->mDirectoryChangeFunc(watcher, watcher->mUserData, BfpFileChangeKind_Failed, watcher->mWatchPath.c_str(),NULL, NULL);
 			continue;
 		}
 
-		// Since events are coalesced into single event, we can have created and removed set at the same time
+		// Since events are coalesced into one, we can have created and removed set at the same time
 		// Check if the file exists and remove the invalid flag
 		if ((flags & kFSEventStreamEventFlagItemRemoved) && (flags & (kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemCloned)))
 		{
@@ -211,7 +263,6 @@ static void FSEventsCallback(
 			{
 				String* newPath;
 				String* oldPath;
-
 				if (CheckPathExists(absFilePath.c_str()))
 				{
 					newPath = &relativeFilePath;
@@ -309,30 +360,12 @@ static void FSEventsCallback(
 
 }
 
-template <bool queueDelete>
-static void DestroyWatcherOnQueue(void* param)
-{
-	BfpFileWatcher* watcher = (BfpFileWatcher*)param;
-	watcher->ReleaseStream();
-	// Has to be queued as there might be events that were enqueued before we released the stream
-	// and they will try to read watcher data
-	if (queueDelete)
-	{
-		bf_dispatch_async_f(watcher->mDispatchQueue, watcher, [](void* data) {
-			BfpFileWatcher* watcher = (BfpFileWatcher*)data;
-			dispatch_queue_t queue = watcher->mDispatchQueue;
-			delete watcher;
-			bf_dispatch_release(queue);
-		});
-	}
-}
-
 class FsEventFileWatchManager : public FileWatchManager
 {
 public:
-	Array<BfpFileWatcher*>	mWatchers;
 	CritSect				mCritSect;
 	bool					mInitialized;
+
 public:
 	FsEventFileWatchManager()
 	{
@@ -419,39 +452,23 @@ bool FsEventFileWatchManager::Init()
 
 void FsEventFileWatchManager::Shutdown()
 {
-	Array<BfpFileWatcher*> watchersToRelease;
-	{
-		AutoCrit autoCrit(mCritSect);
-		if (!mInitialized)
-			return;
+	AutoCrit autoCrit(mCritSect);
+	mInitialized = false;
 
-		mInitialized = false;
-
-		watchersToRelease = std::move(mWatchers);
-	}
-
-	for (const auto& watcher : watchersToRelease)
-		bf_dispatch_async_f(watcher->mDispatchQueue, watcher, &DestroyWatcherOnQueue<false>);
-
-	for (const auto& watcher : watchersToRelease)
-	{
-		// Drain barrier: on a serial queue this returns only once every block has completed
-		bf_dispatch_sync_f(watcher->mDispatchQueue, NULL, [](void*) {});
-		bf_dispatch_release(watcher->mDispatchQueue);
-		delete watcher;
-	}
-
-	// Leaking constants / dlopen symbols is intentional
+	// Leaking of constants / dlopen symbols is intentional
+	// because we don't wait on removed watchers
 }
 
 BfpFileWatcher* FsEventFileWatchManager::WatchDirectory(const char* path, BfpDirectoryChangeFunc callback, BfpFileWatcherFlags flags, void* userData, BfpFileResult* outResult)
 {
-	AutoCrit autoCrit(mCritSect);
-
-	if (!mInitialized)
 	{
-		OUTRESULT(BfpFileResult_UnknownError);
-		return NULL;
+		AutoCrit autoCrit(mCritSect);
+
+		if (!mInitialized)
+		{
+			OUTRESULT(BfpFileResult_UnknownError);
+			return NULL;
+		}
 	}
 
 	char* absPath = realpath(path, NULL);
@@ -478,15 +495,22 @@ BfpFileWatcher* FsEventFileWatchManager::WatchDirectory(const char* path, BfpDir
 	}
 	defer( bf_CFRelease(pathsToWatch) );
 
-	BfpFileWatcher* pFileWatcher = new BfpFileWatcher();
-	pFileWatcher->mWatchPath = path;
-	pFileWatcher->mAbsPath = absPath;
-	pFileWatcher->mDirectoryChangeFunc = callback;
-	pFileWatcher->mUserData = userData;
+	BfpFileWatcher* pWatcher = new BfpFileWatcher();
+	pWatcher->mWatchPath = path;
+	pWatcher->mAbsPath = absPath;
+	pWatcher->mDirectoryChangeFunc = callback;
+	pWatcher->mUserData = userData;
+	pWatcher->mDispatchQueue = bf_dispatch_queue_create("com.beef.filewatcher", NULL);
+	if (pWatcher->mDispatchQueue == NULL)
+	{
+		delete pWatcher;
+		OUTRESULT(BfpFileResult_UnknownError);
+		return NULL;
+	}
 
     FSEventStreamContext context = { };
-	context.info = pFileWatcher;
-    pFileWatcher->mStreamRef = bf_FSEventStreamCreate(
+	context.info = pWatcher;
+    pWatcher->mStreamRef = bf_FSEventStreamCreate(
         NULL,
         ((flags & BfpFileWatcherFlag_IncludeSubdirectories) != 0 ? &FSEventsCallback<false> : &FSEventsCallback<true>),
         &context,
@@ -497,54 +521,49 @@ BfpFileWatcher* FsEventFileWatchManager::WatchDirectory(const char* path, BfpDir
         kFSEventStreamCreateFlagUseExtendedData | kFSEventStreamCreateFlagUseCFTypes
     );
 
-	if (pFileWatcher->mStreamRef == NULL)
+	if (pWatcher->mStreamRef == NULL)
 	{
-		delete pFileWatcher;
+		delete pWatcher;
 		OUTRESULT(BfpFileResult_UnknownError);
 		return NULL;
 	}
 
-	pFileWatcher->mDispatchQueue = bf_dispatch_queue_create("com.beef.filewatcher", NULL);
-	if (pFileWatcher->mDispatchQueue == NULL)
-	{
-    	bf_FSEventStreamRelease(pFileWatcher->mStreamRef);
-		delete pFileWatcher;
-		OUTRESULT(BfpFileResult_UnknownError);
-		return NULL;
-	}
-
-	bf_FSEventStreamSetDispatchQueue(pFileWatcher->mStreamRef, pFileWatcher->mDispatchQueue);
-    if (!bf_FSEventStreamStart(pFileWatcher->mStreamRef))
+	bf_FSEventStreamSetDispatchQueue(pWatcher->mStreamRef, pWatcher->mDispatchQueue);
+    if (!bf_FSEventStreamStart(pWatcher->mStreamRef))
     {
-    	bf_FSEventStreamInvalidate(pFileWatcher->mStreamRef);
-    	bf_FSEventStreamRelease(pFileWatcher->mStreamRef);
-    	bf_dispatch_release(pFileWatcher->mDispatchQueue);
-	    delete pFileWatcher;
+	    delete pWatcher;
     	OUTRESULT(BfpFileResult_UnknownError);
     	return NULL;
     }
 
-	mWatchers.Add(pFileWatcher);
+	pWatcher->mStarted = true;
+
 	OUTRESULT(BfpFileResult_Ok);
-	return pFileWatcher;
+	return pWatcher;
 }
+
 
 void FsEventFileWatchManager::Remove(BfpFileWatcher* watcher)
 {
-
-	bool removed;
+	if (watcher->mShuttingDown.exchange(true))
 	{
-		AutoCrit autoCrit(mCritSect);
-		removed = mWatchers.Remove(watcher);
+		return;
 	}
 
-	// Events might still be generated for a short while
-	// in this case it's not a problem since beef side has it's own
-	// list of registered watchers
-	if (removed)
+	bf_dispatch_async_f(watcher->mDispatchQueue, watcher, [](void* param) {
+		BfpFileWatcher* watcher = (BfpFileWatcher*)param;
+		watcher->ReleaseStream();
+	});
+
+	// Wait for callbacks to exit
 	{
-		bf_dispatch_async_f(watcher->mDispatchQueue, watcher, &DestroyWatcherOnQueue<true>);
+		AutoCrit autoCrit(watcher->mCritSect);
 	}
+
+	bf_dispatch_async_f(watcher->mDispatchQueue, watcher, [](void* param) {
+		BfpFileWatcher* watcher = (BfpFileWatcher*)param;
+		delete watcher;
+	});
 }
 
 FileWatchManager* FileWatchManager::Allocate()
