@@ -232,16 +232,6 @@ static void FSEventsCallback(
 			continue;
 		}
 
-		// Since events are coalesced into one, we can have created and removed set at the same time
-		// Check if the file exists and remove the invalid flag
-		if ((flags & kFSEventStreamEventFlagItemRemoved) && (flags & (kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemCloned)))
-		{
-			if (CheckPathExists(absFilePath.c_str()))
-				flags &= ~kFSEventStreamEventFlagItemRemoved;
-			else
-				flags &= ~(kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemCloned);
-		}
-
 		if (flags & kFSEventStreamEventFlagItemRenamed)
 		{
 			CFNumberRef fileIDCF = (CFNumberRef)bf_CFDictionaryGetValue(dict, bf_kFSEventStreamEventExtendedFileIDKey);
@@ -321,6 +311,16 @@ static void FSEventsCallback(
 			}
 
 			continue;
+		}
+
+		// Since events are coalesced into one, we can have created and removed set at the same time
+		// Check if the file exists and remove the invalid flag
+		if ((flags & kFSEventStreamEventFlagItemRemoved) && (flags & (kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemCloned)))
+		{
+			if (CheckPathExists(absFilePath.c_str()))
+				flags &= ~kFSEventStreamEventFlagItemRemoved;
+			else
+				flags &= ~(kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemCloned);
 		}
 
 		if (flags & (kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemCloned))
