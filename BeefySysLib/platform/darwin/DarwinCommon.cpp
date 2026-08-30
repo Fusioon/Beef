@@ -32,7 +32,6 @@ static void* gCoreServicesLib = NULL;
 
 static dispatch_queue_t (*bf_dispatch_queue_create)(const char* label, void* attr) = NULL;
 static void (*bf_dispatch_async_f)(dispatch_queue_t queue, void* context, dispatch_function_t work) = NULL;
-static void (*bf_dispatch_sync_f)(dispatch_queue_t queue, void* context, dispatch_function_t work) = NULL;
 static void (*bf_dispatch_release)(void* object) = NULL;
 
 // FSEvents Function Pointers
@@ -398,7 +397,6 @@ bool FsEventFileWatchManager::Init()
 #define BF_DP_GET_SYM(name) (symbolsLoaded &= (bf_##name = (decltype(bf_##name))dlsym(RTLD_DEFAULT, #name)) != NULL)
 	BF_DP_GET_SYM(dispatch_queue_create);
 	BF_DP_GET_SYM(dispatch_async_f);
-	BF_DP_GET_SYM(dispatch_sync_f);
 	BF_DP_GET_SYM(dispatch_release);
 #undef BF_DP_GET_SYM
 
