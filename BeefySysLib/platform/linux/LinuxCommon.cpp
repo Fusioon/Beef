@@ -56,6 +56,9 @@ struct BfpFileWatcher
 
 	String GetSubdirPath(int wd)
 	{
+		if (wd == -1)
+			return {};
+
 		SubdirData* sd;
 		if (!mSubdirs.TryGetValue(wd, &sd))
 			return {};
@@ -90,7 +93,7 @@ class InotifyFileWatchManager : public FileWatchManager
     static constexpr size_t NOTIFY_BUFFER_SIZE = (MAX_NOTIFY_EVENTS * (sizeof(inotify_event) + PATH_MAX));
 
     int mInotifyHandle = -1;
-	int mShutdownPipe[2] = {-1, -1};
+	int mShutdownPipe[2] = { -1, -1 };
     pthread_t mWorkerThread = NULL;
     Dictionary<int, BfpFileWatcher*> mWatchers;
     CritSect mCritSect;
@@ -255,7 +258,7 @@ private:
                 if (event->mask & IN_MOVED_FROM)
                 {
                     w->mDirectoryChangeFunc(w, w->mUserData, BfpFileChangeKind_Removed, w->mPath.c_str(), pathBuffer, NULL);
-                    HandleDirRemove(event, w, (w->mHandle == event->wd));
+                    HandleDirRemove(event, w);
                 }
                 if (event->mask & IN_MOVED_TO)
                 {
@@ -341,7 +344,7 @@ private:
         }
         AddWatchEntry(watchHandle, fileWatch);
         AddSubdirEntry(watchHandle, dirPath, fileWatch, event->wd);
-        WatchSubdirectories(dirPath.c_str(), fileWatch, !wasMoved);
+        WatchSubdirectories(dirPath.c_str(), fileWatch, !wasMoved, event->wd);
     }
 
     void AddWatchEntry(int handle, BfpFileWatcher* fileWatcher)
@@ -369,7 +372,27 @@ private:
         }
     }
 
-    void HandleDirectory(DIR* dirp, String& o_path, Array<DIR*>& o_workList, BfpFileWatcher* fileWatcher, int parentWd, bool sendEvents)
+	struct WorkInfo
+    {
+    	enum
+    	{
+    		WorkInfo_SubdirDone,
+    		WorkInfo_SubdirData,
+    		WorkInfo_Parent,
+    	} type;
+
+    	union
+    	{
+    		DIR* dp;
+    		int parentWd;
+    	};
+
+		static WorkInfo SubdirDone() { return  { WorkInfo_SubdirDone }; }
+    	static WorkInfo Subdir(DIR* dp) { return {WorkInfo_SubdirData, dp}; }
+    	static WorkInfo Parent(int wd) { return {.type = WorkInfo_Parent, .parentWd = wd}; }
+    };
+
+    bool HandleDirectory(DIR* dirp, String& o_path, Array<WorkInfo>& o_workList, BfpFileWatcher* fileWatcher, bool sendEvents, int parentWd)
     {
         struct dirent* dp;
         while ((dp = readdir(dirp)) != NULL)
@@ -408,12 +431,14 @@ private:
                  o_path.RemoveToEnd(length);
                  continue;
             }
-            o_workList.Add(dirp);
-            o_workList.Add(todo);
-            return;
+            //o_workList.Add(WorkInfo::Subdir(dirp));
+            o_workList.Add(WorkInfo::Subdir(todo));
+        	o_workList.Add(WorkInfo::Parent(watchHandle));
+            return false;
         }
-        o_workList.Add(NULL);
+        //o_workList.Add(WorkInfo::SubdirDone());
         closedir(dirp);
+    	return true;
     }
 
     void WatchSubdirectories(const char* path, BfpFileWatcher* fileWatcher, bool sendEvents, int parentWd)
@@ -425,7 +450,7 @@ private:
         Array<DIR*> workList;
         String currentPath(path);
 
-        HandleDirectory(dirp, currentPath, workList, fileWatcher, parentWd, sendEvents);
+        HandleDirectory(dirp, currentPath, workList, fileWatcher, sendEvents, parentWd);
         while (workList.size() > 0)
         {
             dirp = workList.back();
@@ -495,11 +520,11 @@ public:
     {
 		if (mShutdownPipe[1] != -1)
 		{
-			const char wake = 1;
+			const char shutdown = 1;
 			ssize_t written;
 			do
 			{
-				written = write(mShutdownPipe[1], &wake, sizeof(wake));
+				written = write(mShutdownPipe[1], &shutdown, sizeof(shutdown));
 			} while (written == -1 && errno == EINTR);
 		}
 
