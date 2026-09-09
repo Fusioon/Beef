@@ -16,6 +16,12 @@
 #define WATCHER_ERRPRINTF(...)
 #endif
 
+struct WatchHandle
+{
+	uint32 mIdx;
+	uint32 mGen;
+};
+
 struct BfpFileWatcher
 {
 	struct SubdirData
@@ -35,7 +41,7 @@ struct BfpFileWatcher
 
     String mPath;
     BfpDirectoryChangeFunc mDirectoryChangeFunc;
-    int mHandle;
+    WatchHandle mHandle;
     BfpFileWatcherFlags mFlags;
     void* mUserData;
 
@@ -69,6 +75,13 @@ struct BfpFileWatcher
 		return path;
 	}
 
+	String GetRelativePath(int wd, const StringView& eventPath)
+	{
+		String subdir = GetSubdirPath(wd);
+		subdir.Append(eventPath);
+		return subdir;
+	}
+
 	bool IsInSubdir(int wd, int target)
 	{
 		if ((target == wd) || (wd == -1))
@@ -84,35 +97,175 @@ struct BfpFileWatcher
 		return IsInSubdir(sd->mParentWd, target);
 	}
 
+	void AddSubdirEntry(int handle, const StringView& name, int parentWd)
+	{
+		mSubdirs[handle] = SubdirData(name, parentWd);
+	}
+
 };
 
 
 class InotifyFileWatchManager : public FileWatchManager
 {
+	struct Slot
+	{
+		int mWd;
+		uint32 mGen;
+		uint32 mRefs;
+		uint32 mParent;
+		uint32 mFirstChild;
+		uint32 mNextSibling;
+		String mName;
+	};
+
     static constexpr size_t MAX_NOTIFY_EVENTS = 64;
     static constexpr size_t NOTIFY_BUFFER_SIZE = (MAX_NOTIFY_EVENTS * (sizeof(inotify_event) + PATH_MAX));
 
     int mInotifyHandle = -1;
 	int mShutdownPipe[2] = { -1, -1 };
+	volatile bool mShuttingDown = false;
     pthread_t mWorkerThread = NULL;
     Dictionary<int, BfpFileWatcher*> mWatchers;
     CritSect mCritSect;
-    char mEventBuffer[NOTIFY_BUFFER_SIZE];
+    alignas(inotify_event) char mEventBuffer[NOTIFY_BUFFER_SIZE];
+
 
 private:
 
+	void DispatchEvent(const inotify_event* event, Array<const inotify_event*> unhandledEvents)
+	{
+		BfpFileWatcher* w;
+        {
+            AutoCrit autoCrit(mCritSect);
+
+            // Watch removed
+            if (event->mask & IN_IGNORED)
+            {
+                mWatchers.Remove(event->wd);
+                return;
+            }
+
+            if (!mWatchers.TryGetValue(event->wd, &w))
+            	return;
+
+            w->Reference();
+
+        }
+        defer( w->Release() );
+
+        String relPath = w->GetRelativePath(event->wd, event->name);
+
+        if (event->mask & (IN_Q_OVERFLOW | IN_UNMOUNT))
+        {
+            w->mDirectoryChangeFunc(w, w->mUserData, BfpFileChangeKind_Failed, w->mPath.c_str(), NULL, NULL);
+            return;
+        }
+
+        if (event->mask & IN_MOVED_FROM)
+        {
+            unhandledEvents.Add(event);
+        }
+        if ((event->mask & IN_MOVED_TO))
+        {
+            bool unhandled = true;
+            for (int i = 0; i < unhandledEvents.size(); i++)
+            {
+                // Same cookie means the events are linked
+				if (event->cookie != unhandledEvents[i]->cookie)
+					continue;
+
+                int subdirWd = -1;
+                if ((event->mask & IN_ISDIR) && (w->mFlags & BfpFileWatcherFlag_IncludeSubdirectories))
+                {
+                    String prevName = String::MakeRef(unhandledEvents[i]->name);
+                    for (const auto& kv : w->mSubdirs)
+                    {
+                    	if ((kv.mValue.mParentWd == unhandledEvents[i]->wd) && (kv.mValue.mName == prevName))
+                    	{
+                    		subdirWd = kv.mKey;
+                    		break;
+                    	}
+                    }
+                }
+
+                // Only handle as rename if src and dst directory is the same
+                // Otherwise emit remove / add
+                if (event->wd == unhandledEvents[i]->wd)
+                {
+                    String prevName = w->GetRelativePath(unhandledEvents[i]->wd, unhandledEvents[i]->name);
+                    w->mDirectoryChangeFunc(w, w->mUserData, BfpFileChangeKind_Renamed, w->mPath.c_str(), prevName.c_str(), relPath.c_str());
+                }
+                else
+                {
+                    String oldPath = w->GetRelativePath(unhandledEvents[i]->wd, unhandledEvents[i]->name);
+                    w->mDirectoryChangeFunc(w, w->mUserData, BfpFileChangeKind_Removed, w->mPath.c_str(), oldPath.c_str(), NULL);
+                    w->mDirectoryChangeFunc(w, w->mUserData, BfpFileChangeKind_Added, w->mPath.c_str(), relPath.c_str(), NULL);
+                }
+
+                if (subdirWd != -1)
+                    w->AddSubdirEntry(subdirWd, event->name, event->wd);
+
+                unhandledEvents.RemoveAtFast(i);
+                unhandled = false;
+                break;
+            }
+
+            if (unhandled)
+                unhandledEvents.Add(event);
+        }
+
+        if (event->mask & IN_CREATE)
+        {
+            w->mDirectoryChangeFunc(w, w->mUserData, BfpFileChangeKind_Added, w->mPath.c_str(), relPath.c_str(), NULL);
+            HandleDirAdd(event, w, relPath, false);
+        }
+        if (event->mask & IN_DELETE)
+        {
+            w->mDirectoryChangeFunc(w, w->mUserData, BfpFileChangeKind_Removed, w->mPath.c_str(), relPath.c_str(), NULL);
+            HandleDirRemove(event, w, false);
+        }
+        if ((event->mask & IN_CLOSE_WRITE) || (event->mask & IN_ATTRIB))
+        {
+            w->mDirectoryChangeFunc(w, w->mUserData, BfpFileChangeKind_Modified, w->mPath.c_str(), relPath.c_str(), NULL);
+        }
+	}
+
+	void DispatchUnhandledEvent(const inotify_event* event)
+	{
+		BfpFileWatcher* w;
+		{
+			AutoCrit autoCrit(mCritSect);
+			if (!mWatchers.TryGetValue(event->wd, &w))
+				return;
+
+			w->Reference();
+		}
+		defer( w->Release() );
+
+		String relPath = w->GetRelativePath(event->wd, event->name);
+
+		if (event->mask & IN_MOVED_FROM)
+		{
+			w->mDirectoryChangeFunc(w, w->mUserData, BfpFileChangeKind_Removed, w->mPath.c_str(), relPath.c_str(), NULL);
+			HandleDirRemove(event, w, true);
+		}
+		if (event->mask & IN_MOVED_TO)
+		{
+			w->mDirectoryChangeFunc(w, w->mUserData, BfpFileChangeKind_Added, w->mPath.c_str(), relPath.c_str(), NULL);
+			HandleDirAdd(event, w, relPath, true);
+		}
+	}
+
     void WorkerProc()
     {
-        char pathBuffer[PATH_MAX];
-
     	struct pollfd fds[2];
     	fds[0].fd = mInotifyHandle;
     	fds[0].events = POLLIN;
     	fds[1].fd = mShutdownPipe[0];
     	fds[1].events = POLLIN;
 
-        Array<inotify_event*> unhandledEvents;
-        while (true)
+        Array<const inotify_event*> unhandledEvents;
+        while (!mShuttingDown)
         {
         	fds[0].revents = 0;
         	fds[1].revents = 0;
@@ -154,118 +307,13 @@ private:
             while(pos < length)
             {
                 inotify_event* event = (inotify_event*) &mEventBuffer[pos];
-            	defer ( pos += sizeof(inotify_event) + event->len );
-                if(event->len == 0)
-					continue;
-
-                BfpFileWatcher* w;
-            	String subdir;
-                {
-                    AutoCrit autoCrit(mCritSect);
-
-                	// Watch removed
-                	if (event->mask & IN_IGNORED)
-                	{
-                		mWatchers.Remove(event->wd);
-                		continue;
-                	}
-
-                    if (!mWatchers.TryGetValue(event->wd, &w))
-                        continue;
-
-                	w->Reference();
-                	subdir = w->GetSubdirPath(event->wd);
-                }
-            	defer( w->Release() );
-
-            	if (event->mask & (IN_Q_OVERFLOW | IN_UNMOUNT))
-            	{
-            		w->mDirectoryChangeFunc(w, w->mUserData, BfpFileChangeKind_Failed, w->mPath.c_str(), NULL, NULL);
-            		continue;
-            	}
-
-                if (GetRelativePath(pathBuffer, sizeof(pathBuffer), event->name, event->len, w, subdir) == 0)
-                {
-                    // our buffer was too small, we can't handle this event
-                    continue;
-                }
-
-                if (event->mask & IN_MOVED_FROM)
-                {
-                    unhandledEvents.Add(event);
-                }
-                if ((event->mask & IN_MOVED_TO))
-                {
-                    bool handled = false;
-                    for (int i = 0; i < unhandledEvents.size(); i++)
-                    {
-                        // Only handle as rename if src and dst directory is the same
-                        if ((event->cookie == unhandledEvents[i]->cookie) && (event->wd == unhandledEvents[i]->wd))
-                        {
-                            char renameBuffer[PATH_MAX];
-                            if (GetRelativePath(renameBuffer, sizeof(renameBuffer), unhandledEvents[i]->name, unhandledEvents[i]->len, w, subdir) == 0)
-                            {
-                               break;
-                            }
-                            w->mDirectoryChangeFunc(w, w->mUserData, BfpFileChangeKind_Renamed, w->mPath.c_str(), renameBuffer, pathBuffer);
-                            unhandledEvents.RemoveAtFast(i);
-                            handled = true;
-                            break;
-                        }
-                    }
-
-                    if (!handled)
-                    {
-                        unhandledEvents.Add(event);
-                    }
-                }
-
-                if (event->mask & IN_CREATE)
-                {
-                    w->mDirectoryChangeFunc(w, w->mUserData, BfpFileChangeKind_Added, w->mPath.c_str(), pathBuffer, NULL);
-                    HandleDirAdd(event, w, subdir, false);
-                }
-                if (event->mask & IN_DELETE)
-                {
-                    w->mDirectoryChangeFunc(w, w->mUserData, BfpFileChangeKind_Removed, w->mPath.c_str(), pathBuffer, NULL);
-                    HandleDirRemove(event, w);
-                }
-                if ((event->mask & IN_CLOSE_WRITE) || (event->mask & IN_ATTRIB))
-                {
-                    w->mDirectoryChangeFunc(w, w->mUserData, BfpFileChangeKind_Modified, w->mPath.c_str(), pathBuffer, NULL);
-                }
+            	DispatchEvent(event, unhandledEvents);
+            	pos += sizeof(inotify_event) + event->len;
             }
 
             for (auto event : unhandledEvents)
             {
-                BfpFileWatcher* w;
-            	String subdir;
-
-                {
-                    AutoCrit autoCrit(mCritSect);
-                    if (!mWatchers.TryGetValue(event->wd, &w))
-                        continue;
-                	w->Reference();
-                	subdir = w->GetSubdirPath(event->wd);
-                }
-            	defer (w->Release());
-
-                if (GetRelativePath(pathBuffer, sizeof(pathBuffer), event->name, event->len, w, subdir) == 0)
-                {
-                    continue;
-                }
-
-                if (event->mask & IN_MOVED_FROM)
-                {
-                    w->mDirectoryChangeFunc(w, w->mUserData, BfpFileChangeKind_Removed, w->mPath.c_str(), pathBuffer, NULL);
-                    HandleDirRemove(event, w);
-                }
-                if (event->mask & IN_MOVED_TO)
-                {
-                    w->mDirectoryChangeFunc(w, w->mUserData, BfpFileChangeKind_Added, w->mPath.c_str(), pathBuffer, NULL);
-                    HandleDirAdd(event, w, subdir, true);
-                }
-
+                DispatchUnhandledEvent(event);
             }
             unhandledEvents.Clear();
         }
@@ -278,7 +326,7 @@ private:
         return NULL;
     }
    
-    void HandleDirRemove(const inotify_event* event, BfpFileWatcher* fileWatch)
+    void HandleDirRemove(const inotify_event* event, BfpFileWatcher* fileWatch, bool moved)
     {
     	if ((event->mask & IN_ISDIR) == 0)
     		return;
@@ -290,7 +338,7 @@ private:
 
     	// If we are not inside a subdir that means we are the root
 		// inotify watchers are automatically removed
-    	if (!isSubdir)
+    	if ((!isSubdir) && (!moved))
 			return;
         
         AutoCrit autoCrit(mCritSect);
@@ -306,12 +354,11 @@ private:
     	for (int handle : toRemove)
     	{
         	fileWatch->mSubdirs.Remove(handle);
-    		if (mWatchers.Remove(handle))
-    			InotifyRemoveWatch(handle);
+    		InotifyRemoveWatch(handle);
     	}
     }
 
-    void HandleDirAdd(const inotify_event* event, BfpFileWatcher* fileWatch, const StringView& subdir, bool wasMoved)
+    void HandleDirAdd(const inotify_event* event, BfpFileWatcher* fileWatch, const String& relPath, bool moved)
     {
     	if ((event->mask & IN_ISDIR) == 0)
     		return;
@@ -326,167 +373,111 @@ private:
         		return;
         }
 
-        String dirPath = fileWatch->mPath;
-
-        if (!subdir.IsEmpty())
-        {
-            dirPath.Append('/');
-            dirPath.Append(subdir);
-        }
-        dirPath.Append('/');
-        dirPath.Append(event->name);
-
-        int watchHandle = InotifyWatchPath(dirPath.c_str());
+        int watchHandle = InotifyWatchPath(relPath.c_str());
         if (watchHandle == -1)
         {
             WATCHER_ERRPRINTF("Failed to add watch for subdirectory '%s' (%d)\n", dirPath.c_str(), errno);
             return;
         }
         AddWatchEntry(watchHandle, fileWatch);
-        AddSubdirEntry(watchHandle, dirPath, fileWatch, event->wd);
-        WatchSubdirectories(dirPath.c_str(), fileWatch, !wasMoved, event->wd);
+        fileWatch->AddSubdirEntry(watchHandle, relPath, event->wd);
+        WatchSubdirectories(relPath.c_str(), fileWatch, !moved, event->wd);
     }
 
     void AddWatchEntry(int handle, BfpFileWatcher* fileWatcher)
     {
-        AutoCrit autoCrit(mCritSect);
         mWatchers[handle] = fileWatcher;
     }
 
-    void AddSubdirEntry(int handle, const StringView& name, BfpFileWatcher* fileWatcher, int parentWd)
+    WatchHandle InotifyWatchPath(const String& path)
     {
-        AutoCrit autoCrit(mCritSect);
-		fileWatcher->mSubdirs[handle] = BfpFileWatcher::SubdirData(name, parentWd);
-    }
-
-    int InotifyWatchPath(const char* path)
-    {
-        return inotify_add_watch(mInotifyHandle, path, IN_CREATE | IN_DELETE | IN_CLOSE_WRITE | IN_ATTRIB | IN_MOVE);
+        int wd = inotify_add_watch(mInotifyHandle, path.c_str(), IN_CREATE | IN_DELETE | IN_CLOSE_WRITE | IN_ATTRIB | IN_MOVE);
+		return wd;
     }
 
     void InotifyRemoveWatch(int handle)
     {
+    	if ((!mWatchers.Remove(handle)))
+			return;
+
         if (inotify_rm_watch(mInotifyHandle, handle) == -1)
         {
             WATCHER_ERRPRINTF("Failed to remove watch handle(%d) err(%d)\n", handle, errno);
         }
     }
 
-	struct WorkInfo
+    void WatchSubdirectories(const String& path, BfpFileWatcher* fileWatcher, bool sendEvents, int parentWd)
     {
-    	enum
-    	{
-    		WorkInfo_SubdirDone,
-    		WorkInfo_SubdirData,
-    		WorkInfo_Parent,
-    	} type;
-
-    	union
-    	{
-    		DIR* dp;
-    		int parentWd;
-    	};
-
-		static WorkInfo SubdirDone() { return  { WorkInfo_SubdirDone }; }
-    	static WorkInfo Subdir(DIR* dp) { return {WorkInfo_SubdirData, dp}; }
-    	static WorkInfo Parent(int wd) { return {.type = WorkInfo_Parent, .parentWd = wd}; }
-    };
-
-    bool HandleDirectory(DIR* dirp, String& o_path, Array<WorkInfo>& o_workList, BfpFileWatcher* fileWatcher, bool sendEvents, int parentWd)
-    {
-        struct dirent* dp;
-        while ((dp = readdir(dirp)) != NULL)
-        {
-            if (!strcmp(dp->d_name, ".") || !strcmp(dp->d_name, ".."))
-                continue;
-
-            // Send events for files/dirs inside the directory as don't receive events in newly created directories 
-            if (sendEvents)
-            {
-                String localPath = o_path.Substring(std::min(o_path.length(), fileWatcher->mPath.length()+1));
-                localPath.Append('/');
-                localPath.Append(dp->d_name);
-                fileWatcher->mDirectoryChangeFunc(fileWatcher, fileWatcher->mUserData, BfpFileChangeKind_Added, fileWatcher->mPath.c_str(), localPath.c_str(), NULL);
-                fileWatcher->mDirectoryChangeFunc(fileWatcher, fileWatcher->mUserData, BfpFileChangeKind_Modified, fileWatcher->mPath.c_str(), localPath.c_str(), NULL);
-            }
-
-            if (dp->d_type != DT_DIR)
-                continue;
-
-            const auto length = o_path.length();
-            o_path.Append('/');
-            o_path.Append(dp->d_name);
-            int watchHandle = InotifyWatchPath(o_path.c_str());
-            if (watchHandle == -1)
-            {
-                o_path.RemoveToEnd(length);
-                WATCHER_ERRPRINTF("Failed to add watch for subdirectory '%s' (%d)\n", o_path.c_str(), errno);
-                continue;
-            }
-            AddWatchEntry(watchHandle, fileWatcher);
-            AddSubdirEntry(watchHandle, o_path, fileWatcher, parentWd);
-            DIR* todo = opendir(o_path.c_str());
-            if (todo == NULL)
-            {
-                 o_path.RemoveToEnd(length);
-                 continue;
-            }
-            //o_workList.Add(WorkInfo::Subdir(dirp));
-            o_workList.Add(WorkInfo::Subdir(todo));
-        	o_workList.Add(WorkInfo::Parent(watchHandle));
-            return false;
-        }
-        //o_workList.Add(WorkInfo::SubdirDone());
-        closedir(dirp);
-    	return true;
-    }
-
-    void WatchSubdirectories(const char* path, BfpFileWatcher* fileWatcher, bool sendEvents, int parentWd)
-    {
-        DIR* dirp = opendir(path);
+        DIR* dirp = opendir(path.c_str());
         if (dirp == NULL)
             return;
 
         Array<DIR*> workList;
         String currentPath(path);
 
-        HandleDirectory(dirp, currentPath, workList, fileWatcher, sendEvents, parentWd);
+    	workList.Add(dirp);
+
+        int currentParentWd = parentWd;
+    	Array<int> parents;
+    	parents.Add(currentParentWd);
+
         while (workList.size() > 0)
         {
-            dirp = workList.back();
-            workList.pop_back();
-            if (dirp == NULL)
-            {
-                auto dirSeparator = currentPath.LastIndexOf('/');
-                if (dirSeparator == -1)
-                {
-                    BF_ASSERT(workList.IsEmpty());
-                    break;
-                }
-                currentPath.RemoveToEnd(dirSeparator);
-                continue;
-            }
-            HandleDirectory(dirp, currentPath, workList, fileWatcher, sendEvents);
-        }
-    }
+        	DIR* current = workList.front();
 
-    static int GetRelativePath(char* buffer, int bufferSize, const char* fileName, int fileNameLength, const BfpFileWatcher* fileWatcher, const StringView& subdir)
-    {
-        if (subdir.IsEmpty())
-        {
-            memcpy(buffer, fileName, fileNameLength);
-            return fileNameLength;
-        }
+        	struct dirent* dp;
+        	while ((dp = readdir(current)) != NULL)
+        	{
+        		if (!strcmp(dp->d_name, ".") || !strcmp(dp->d_name, ".."))
+        			continue;
 
-        const auto subdirLength = subdir.length();
-        if (bufferSize < (subdirLength + fileNameLength + 2))
-            return 0;
-        memcpy(buffer, subdir.mPtr, subdirLength);
-        buffer[subdirLength] = '/';
-        buffer += subdirLength + 1;
-        memcpy(buffer, fileName, fileNameLength);
-        buffer[fileNameLength] = '\0';
-        return subdirLength + fileNameLength + 1;
+        		// Send events for files/dirs inside the directory as don't receive events in newly created directories
+        		if (sendEvents)
+        		{
+        			String localPath = currentPath.Substring(std::min(currentPath.length(), fileWatcher->mPath.length()+1));
+        			localPath.Append('/');
+        			localPath.Append(dp->d_name);
+        			fileWatcher->mDirectoryChangeFunc(fileWatcher, fileWatcher->mUserData, BfpFileChangeKind_Added, fileWatcher->mPath.c_str(), localPath.c_str(), NULL);
+        			fileWatcher->mDirectoryChangeFunc(fileWatcher, fileWatcher->mUserData, BfpFileChangeKind_Modified, fileWatcher->mPath.c_str(), localPath.c_str(), NULL);
+        		}
+
+        		if (dp->d_type != DT_DIR)
+        			continue;
+
+        		const auto length = currentPath.length();
+        		currentPath.Append('/');
+        		currentPath.Append(dp->d_name);
+        		int watchHandle = InotifyWatchPath(currentPath.c_str());
+        		if (watchHandle == -1)
+        		{
+        			currentPath.RemoveToEnd(length);
+        			WATCHER_ERRPRINTF("Failed to add watch for subdirectory '%s' (%d)\n", o_path.c_str(), errno);
+        			continue;
+        		}
+        		AddWatchEntry(watchHandle, fileWatcher);
+        		fileWatcher->AddSubdirEntry(watchHandle, currentPath, currentParentWd);
+        		DIR* todo = opendir(currentPath.c_str());
+        		if (todo == NULL)
+        		{
+        			currentPath.RemoveToEnd(length);
+        			continue;
+        		}
+        		parents.Add(watchHandle);
+        		workList.Add(todo);
+        	}
+
+        	workList.RemoveAt(0);
+        	closedir(dirp);
+        	auto dirSeparator = currentPath.LastIndexOf('/');
+        	if (dirSeparator == -1)
+        	{
+        		BF_ASSERT(workList.IsEmpty());
+        		return;
+        	}
+        	currentPath.RemoveToEnd(dirSeparator);
+        	currentParentWd = parents.GetFirstSafe();
+        	parents.RemoveAt(0);
+        }
     }
 
 public:
@@ -518,6 +509,8 @@ public:
 
 	void Shutdown() override
     {
+		mShuttingDown = true;
+
 		if (mShutdownPipe[1] != -1)
 		{
 			const char shutdown = 1;
@@ -528,7 +521,7 @@ public:
 			} while (written == -1 && errno == EINTR);
 		}
 
-		if (mWorkerThread != NULL)
+		if ((mWorkerThread != NULL))
 		{
 			pthread_join(mWorkerThread, NULL);
 			mWorkerThread = NULL;
@@ -561,8 +554,32 @@ public:
             OUTRESULT(BfpFileResult_UnknownError);
             return NULL;
         }
+
+		String watchPath;
+		// Make watch path lexically absolute, so it won't change when working directory changes
+		if (path[0] != '/')
+		{
+			char* cwdPtr = getcwd(NULL, 0);
+			if (cwdPtr)
+			{
+				String cwdPath = String::MakeRef(cwdPtr);
+				watchPath = GetAbsPath(path, cwdPath);
+				free(cwdPtr);
+			}
+			else
+			{
+				OUTRESULT(BfpFileResult_NotFound);
+				return NULL;
+			}
+		}
+		else
+		{
+			watchPath = GetAbsPath(path, "/");
+		}
+
+
         BfpFileWatcher* fileWatcher = new BfpFileWatcher();
-        fileWatcher->mPath = path;
+        fileWatcher->mPath = watchPath;
         fileWatcher->mDirectoryChangeFunc = callback;
         fileWatcher->mHandle = watchHandle;
         fileWatcher->mFlags = flags;
@@ -585,17 +602,11 @@ public:
         {
             for (const auto& subdir : watcher->mSubdirs)
             {
-            	if (mWatchers.Remove(subdir.mKey))
-            		InotifyRemoveWatch(subdir.mKey);
+            	InotifyRemoveWatch(subdir.mKey);
             }
         }
 
-	    // Check if watched directory exists so we don't error/remove other watch
-	    if ((DirectoryExists(watcher->mPath)) && (mWatchers.Remove(watcher->mHandle)))
-	    {
-	        InotifyRemoveWatch(watcher->mHandle);
-	    }
-
+		InotifyRemoveWatch(watcher->mHandle);
 		watcher->Release();
     }
 
