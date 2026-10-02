@@ -1487,7 +1487,11 @@ void BfIRCodeGen::Read(BfIRTypedValue& typedValue, BfIRCodeGenEntry** codeGenEnt
 		else if (BfIRBuilder::IsInt(typeCode))
 		{
 			int64 intVal = ReadSLEB128();
-			auto constVal = llvm::ConstantInt::get(llvmConstType, intVal);
+			// intVal is sign-extended to 64 bits; truncate it to the constant's width. LLVM 23
+			// defaults ImplicitTrunc to false, which leaves the high bits set in the APInt of a
+			// negative i8/i16/i32 (unchecked without LLVM assertions) and miscompiles code that
+			// reasons about its range.
+			auto constVal = llvm::ConstantInt::get(llvmConstType, intVal, /*IsSigned*/false, /*ImplicitTrunc*/true);
 			auto constInt = (llvm::ConstantInt*)constVal;
 			typedValue.mValue = constInt;
 		}
@@ -1976,7 +1980,7 @@ void BfIRCodeGen::CreateMemSet(llvm::Value* addr, llvm::Value* val, llvm::Value*
 			{
 				headVal = NULL;
 				auto intTy = llvm::Type::getInt32Ty(*mLLVMContext);
-				auto constVal = llvm::ConstantInt::get(intTy, ((int)setVal << 24) | ((int)setVal << 16) | ((int)setVal << 8) | ((int)setVal));
+				auto constVal = llvm::ConstantInt::get(intTy, ((int)setVal << 24) | ((int)setVal << 16) | ((int)setVal << 8) | ((int)setVal), /*IsSigned*/false, /*ImplicitTrunc*/true);
 				while (sizeLeft >= 4)
 				{
 					if (headVal == NULL)
@@ -3714,7 +3718,7 @@ void BfIRCodeGen::HandleNextCmd()
 						std::vector<llvm::Constant*> chars(strContent[0].size());
 						for (unsigned int i = 0; i < strContent[0].size(); i++)
 						{
-							chars[i] = llvm::ConstantInt::get(charType, strContent[0][i]);;
+							chars[i] = llvm::ConstantInt::get(charType, strContent[0][i], /*IsSigned*/false, /*ImplicitTrunc*/true);
 						}
 
 						chars.push_back(llvm::ConstantInt::get(charType, 0));
@@ -5981,7 +5985,7 @@ void BfIRCodeGen::SetCodeGenOptions(BfCodeGenOptions codeGenOptions)
 
 void BfIRCodeGen::SetConfigConst(int idx, int value)
 {
-	auto constVal = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*mLLVMContext), value);
+	auto constVal = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*mLLVMContext), value, /*IsSigned*/false, /*ImplicitTrunc*/true);
 	BF_ASSERT(idx == (int)mConfigConsts32.size());
 	mConfigConsts32.Add(constVal);
 
