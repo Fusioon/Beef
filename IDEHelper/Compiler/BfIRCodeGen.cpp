@@ -3133,7 +3133,7 @@ void BfIRCodeGen::HandleNextCmd()
 			CMD_PARAM(String, str);
 
 			BfIRTypedValue result;
-			result.mValue = mIRBuilder->CreateGlobalStringPtr(llvm::StringRef(str.c_str(), str.length()));
+			result.mValue = mIRBuilder->CreateGlobalString(llvm::StringRef(str.c_str(), str.length()));
 			result.mTypeEx = GetTypeEx(result.mValue->getType());
 			SetResult(curId, result);
 		}
@@ -3346,12 +3346,13 @@ void BfIRCodeGen::HandleNextCmd()
 
 			llvm::Function* func = NULL;
 
+			// mArgN select the intrinsic's overload types: a param index, -2 for the return type, -1 to end
 			struct _Intrinsics
 			{
 				llvm::Intrinsic::ID mID;
-				int mArg0;
-				int mArg1;
-				int mArg2;
+				int mArg0 = -1;
+				int mArg1 = -1;
+				int mArg2 = -1;
 			};
 
 			static _Intrinsics intrinsics[] =
@@ -3378,7 +3379,7 @@ void BfIRCodeGen::HandleNextCmd()
 				{ (llvm::Intrinsic::ID)-2, -1}, // AtomicUMin,
 				{ (llvm::Intrinsic::ID)-2, -1}, // AtomicXChg,
 				{ (llvm::Intrinsic::ID)-2, -1}, // AtomicXor,
-				{ llvm::Intrinsic::bswap, -1},
+				{ llvm::Intrinsic::bswap, 0},
 				{ (llvm::Intrinsic::ID)-2, -1}, // cast,
 				{ llvm::Intrinsic::cos, 0, -1},
 				{ (llvm::Intrinsic::ID)-2, -1}, // cpuid
@@ -3400,7 +3401,7 @@ void BfIRCodeGen::HandleNextCmd()
 				{ (llvm::Intrinsic::ID)-2, -1}, // max
 				{ (llvm::Intrinsic::ID)-2, -1}, // memcmp
 				{ llvm::Intrinsic::memcpy, 0, 1, 2},
-				{ llvm::Intrinsic::memmove, 0, 2},
+				{ llvm::Intrinsic::memmove, 0, 1, 2},
 				{ llvm::Intrinsic::memset, 0, 2},
 				{ (llvm::Intrinsic::ID)-2, -1}, // min
 				{ (llvm::Intrinsic::ID)-2, -1}, // mod
@@ -3409,8 +3410,8 @@ void BfIRCodeGen::HandleNextCmd()
 				{ (llvm::Intrinsic::ID)-2, -1}, // not
 				{ (llvm::Intrinsic::ID)-2, -1}, // or
 				{ llvm::Intrinsic::pow, 0, -1},
-				{ llvm::Intrinsic::powi, 0, -1},
-				{ llvm::Intrinsic::returnaddress, -1},
+				{ llvm::Intrinsic::powi, 0, 1},
+				{ llvm::Intrinsic::returnaddress, -2},
 				{ llvm::Intrinsic::round, 0, -1},
 				{ (llvm::Intrinsic::ID)-2, -1}, // sar
 				{ (llvm::Intrinsic::ID)-2, -1}, // shl
@@ -3429,17 +3430,11 @@ void BfIRCodeGen::HandleNextCmd()
 			BF_STATIC_ASSERT(BF_ARRAY_COUNT(intrinsics) == BfIRIntrinsic_COUNT);
 
 			CmdParamVec<llvm::Type*> useParams;
-			if (intrinsics[intrinId].mArg0 != -1)
+			for (int argIdx : { intrinsics[intrinId].mArg0, intrinsics[intrinId].mArg1, intrinsics[intrinId].mArg2 })
 			{
-				useParams.push_back(paramTypes[0]->mLLVMType);
-				if (intrinsics[intrinId].mArg1 != -1)
-				{
-					useParams.push_back(paramTypes[1]->mLLVMType);
-					if (intrinsics[intrinId].mArg2 != -1)
-					{
-						useParams.push_back(paramTypes[2]->mLLVMType);
-					}
-				}
+				if (argIdx == -1)
+					break;
+				useParams.push_back((argIdx == -2) ? returnType->mLLVMType : paramTypes[argIdx]->mLLVMType);
 			}
 
 			bool isFakeIntrinsic = (int)intrinsics[intrinId].mID == -2;
@@ -6123,9 +6118,7 @@ llvm::Value* BfIRCodeGen::CreateFAddSub(llvm::Value* lhs, llvm::Value* rhs, bool
 		};
 		auto emitFMulAdd = [&](llvm::Value* a, llvm::Value* b, llvm::Value* c) -> llvm::Value*
 		{
-			auto call = mIRBuilder->CreateIntrinsic(llvm::Intrinsic::fmuladd, { a->getType() }, { a, b, c });
-			call->copyFastMathFlags(mIRBuilder->getFastMathFlags());
-			return call;
+			return mIRBuilder->CreateIntrinsic(llvm::Intrinsic::fmuladd, { a->getType() }, { a, b, c }, mIRBuilder->getFastMathFlags());
 		};
 		if (auto mul = fusableMul(lhs))
 			return emitFMulAdd(mul->getOperand(0), mul->getOperand(1), isSub ? mIRBuilder->CreateFNeg(rhs) : rhs);

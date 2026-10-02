@@ -351,10 +351,10 @@ void LLDBDebugger::DoLaunch()
 
 #ifdef __linux__
 	// Distribution LLDB packages can fail to find their own lldb-server (Ubuntu's looks for
-	// a fully versioned 'lldb-server-22.x.y'), which makes every local launch fail.
+	// a fully versioned 'lldb-server-23.x.y'), which makes every local launch fail.
 	if (getenv("LLDB_DEBUGSERVER_PATH") == NULL)
 	{
-		const char* serverPaths[] = { "/usr/lib/llvm-22/bin/lldb-server", "/usr/bin/lldb-server-22", "/usr/bin/lldb-server" };
+		const char* serverPaths[] = { "/usr/lib/llvm-23/bin/lldb-server", "/usr/bin/lldb-server-23", "/usr/bin/lldb-server" };
 		for (auto serverPath : serverPaths)
 		{
 			if (access(serverPath, X_OK) == 0)

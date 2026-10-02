@@ -10611,9 +10611,9 @@ namespace IDE
 				return;
 
 			String missing = scope .();
-			void CheckTool(String name, String outPath, bool requireLLVM22)
+			void CheckTool(String name, String outPath, bool requireLLVM23)
 			{
-				if (BuildContext.FindLinuxLLVMTool(name, outPath, requireLLVM22) case .Err)
+				if (BuildContext.FindLinuxLLVMTool(name, outPath, requireLLVM23) case .Err)
 				{
 					if (!missing.IsEmpty)
 						missing.Append(", ");
@@ -10626,7 +10626,7 @@ namespace IDE
 			if (!missing.IsEmpty)
 			{
 				mLinuxLLVMFallback = true;
-				OutputLineSmart("WARNING: Linux LLVM tools missing or incompatible: {}. Building with the GNU toolset and LTO disabled for all projects. Install clang-22, lld-22, and llvm-22 to enable ThinLTO.", missing);
+				OutputLineSmart("WARNING: Linux LLVM tools missing or incompatible: {}. Building with the GNU toolset and LTO disabled for all projects. Install clang-23, lld-23, and llvm-23 to enable ThinLTO.", missing);
 			}
 		}
 

@@ -25,8 +25,8 @@ jobs:
       - run: |
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
-          sudo ./llvm.sh 22
-          sudo apt-get install -y llvm-22-dev
+          sudo ./llvm.sh 23
+          sudo apt-get install -y llvm-23-dev
       - run: bin/build.sh
   build-linux-ide:
     name: Build IDE on Linux
@@ -53,8 +53,8 @@ jobs:
       - run: |
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
-          sudo ./llvm.sh 22
-          sudo apt-get install -y llvm-22-dev libsystemd-dev libcurl4-openssl-dev
+          sudo ./llvm.sh 23
+          sudo apt-get install -y llvm-23-dev libsystemd-dev libcurl4-openssl-dev
       - run: bin/build.sh ide
   build-macos:
     name: Build on macOS
@@ -69,6 +69,6 @@ jobs:
       - uses: actions/checkout@v5
       - run: |
           brew update
-          brew install llvm@22
-          echo "$(brew --prefix llvm@22)/bin" >> $GITHUB_PATH
+          brew install llvm@23
+          echo "$(brew --prefix llvm@23)/bin" >> $GITHUB_PATH
       - run: bin/build.sh

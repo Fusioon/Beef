@@ -50,8 +50,8 @@ else
 	echo "Ninja isn't installed, consider installing it for faster build speeds."
 fi
 
-LLVM_CONFIG=$(command -v llvm-config-22 2>/dev/null ||
-              command -v /usr/lib/llvm22/bin/llvm-config 2>/dev/null ||
+LLVM_CONFIG=$(command -v llvm-config-23 2>/dev/null ||
+              command -v /usr/lib/llvm23/bin/llvm-config 2>/dev/null ||
               command -v llvm-config 2>/dev/null)
 LLVM_FOUND=0
 LLVM_DIR=""
@@ -60,7 +60,7 @@ if [ -n "$LLVM_CONFIG" ]; then
   LLVM_VERSION=$($LLVM_CONFIG --version)
   LLVM_MAJOR_VERSION=$(echo "$LLVM_VERSION" | cut -d. -f1)
   LLVM_MINOR_VERSION=$(echo "$LLVM_VERSION" | cut -d. -f2)
-  if [ "$LLVM_MAJOR_VERSION" = "22" ] && [ "$LLVM_MINOR_VERSION" = "1" ]; then
+  if [ "$LLVM_MAJOR_VERSION" = "23" ] && [ "$LLVM_MINOR_VERSION" = "1" ]; then
     LLVM_FOUND=1
     # Get the LLVM prefix directory and construct cmake path from it
     LLVM_PREFIX=$($LLVM_CONFIG --prefix)
@@ -74,7 +74,7 @@ set -e
 ### Dependencies ###
 
 if [ $LLVM_FOUND == 0 ]; then
-	echo "ERROR: LLVM 22.1 was not detected on your system. Please install the package 'llvm-22-dev' and try again." >&2
+	echo "ERROR: LLVM 23.1 was not detected on your system. Please install the package 'llvm-23-dev' and try again." >&2
 	exit 1
 fi
 
@@ -90,8 +90,8 @@ fi
 
 if [[ "$OSTYPE" == "darwin"* ]] && \
 	[ "$(command -v brew)" ]; then
-	export LIBRARY_PATH=$(brew --prefix llvm@22)/lib
-	export LD_RUN_PATH=$(brew --prefix llvm@22)/lib
+	export LIBRARY_PATH=$(brew --prefix llvm@23)/lib
+	export LD_RUN_PATH=$(brew --prefix llvm@23)/lib
 fi
 
 cd ..

@@ -216,9 +216,9 @@ namespace IDE
 			return .Err;
 		}
 
-		public static Result<void> FindLinuxLLVMTool(String name, String outPath, bool requireLLVM22)
+		public static Result<void> FindLinuxLLVMTool(String name, String outPath, bool requireLLVM23)
 		{
-			for (let candidate in scope String[](scope String(name, "-22"), name))
+			for (let candidate in scope String[](scope String(name, "-23"), name))
 			{
 				outPath.Clear();
 				if (FindExecutableInPath(candidate, outPath) case .Err)
@@ -247,7 +247,7 @@ namespace IDE
 				}
 				if (process.ExitCode != 0)
 					continue;
-				if (requireLLVM22)
+				if (requireLLVM23)
 				{
 					let reader = scope StreamReader(outputStream);
 					String output = scope .();
@@ -264,7 +264,7 @@ namespace IDE
 						versionStart += 4;
 					}
 					int versionEnd = output.IndexOf('.', versionStart);
-					if ((versionEnd < 0) || (int.Parse(output.Substring(versionStart, versionEnd - versionStart)).GetValueOrDefault() < 22))
+					if ((versionEnd < 0) || (int.Parse(output.Substring(versionStart, versionEnd - versionStart)).GetValueOrDefault() < 23))
 						continue;
 				}
 				return .Ok;

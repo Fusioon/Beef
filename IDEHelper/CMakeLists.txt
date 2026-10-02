@@ -173,7 +173,7 @@ file(GLOB SRC_FILES
     Backend/BeModule.cpp
 )
 
-find_package(LLVM 22.1 CONFIG COMPONENTS)
+find_package(LLVM 23.1 CONFIG COMPONENTS)
 
 if (LLVM_FOUND)
   message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
@@ -182,7 +182,7 @@ if (LLVM_FOUND)
   include_directories(${LLVM_INCLUDE_DIRS})
   add_definitions(${LLVM_DEFINITIONS})
 
-  string(APPEND TARGET_LIBS_OS "-lLLVM-22 ${LLVM_SYSTEM_LIBS}")
+  string(APPEND TARGET_LIBS_OS "-lLLVM-23 ${LLVM_SYSTEM_LIBS}")
   string(STRIP ${TARGET_LIBS_OS} TARGET_LIBS_OS)
 else()
   message(FATAL_ERROR "LLVM not found")
@@ -190,7 +190,7 @@ endif()
 
 if(UNIX AND NOT APPLE)
   find_path(LLDB_INCLUDE_DIR lldb/API/LLDB.h HINTS ${LLVM_INCLUDE_DIRS})
-  find_library(LLDB_LIBRARY NAMES lldb-22 liblldb-22 lldb liblldb HINTS ${LLVM_LIBRARY_DIRS})
+  find_library(LLDB_LIBRARY NAMES lldb-23 liblldb-23 lldb liblldb HINTS ${LLVM_LIBRARY_DIRS})
 
   if (LLDB_INCLUDE_DIR AND LLDB_LIBRARY)
     message(STATUS "Found LLDB: ${LLDB_LIBRARY}")
