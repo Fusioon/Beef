@@ -1917,7 +1917,7 @@ String BfIRBuilder::ToString(BfIRType irType)
 			else if (irType.mKind == BfIRType::TypeKind::TypeKind_TypeInstId)
 				llvmType = typeEntry.mInstType->mLLVMType;
 			else if (irType.mKind == BfIRType::TypeKind::TypeKind_TypeInstPtrId)
-				llvmType = typeEntry.mInstType->mLLVMType->getPointerTo();
+				llvmType = llvm::PointerType::getUnqual(typeEntry.mInstType->mLLVMType->getContext());
 		}
 
 		if (llvmType == NULL)

@@ -1716,10 +1716,7 @@ llvm::Value* BfIRCodeGen::TryToVector(const BfIRTypedValue& value)
  		if (auto arrType = llvm::dyn_cast<llvm::ArrayType>(ptrElemType->mLLVMType))
  		{
  			auto vecType = llvm::FixedVectorType::get(arrType->getArrayElementType(), (uint)arrType->getArrayNumElements());
- 			auto vecPtrType = vecType->getPointerTo();
-
- 			auto ptrVal0 = mIRBuilder->CreateBitCast(value.mValue, vecPtrType);
- 			return mIRBuilder->CreateAlignedLoad(vecType, ptrVal0, llvm::MaybeAlign(1));
+ 			return mIRBuilder->CreateAlignedLoad(vecType, value.mValue, llvm::MaybeAlign(1));
  		}
 
  		if (auto vecType = llvm::dyn_cast<llvm::VectorType>(ptrElemType->mLLVMType))
@@ -1745,14 +1742,13 @@ bool BfIRCodeGen::TryMemCpy(const BfIRTypedValue& ptr, llvm::Value* val)
 
 	auto int8Ty = llvm::Type::getInt8Ty(*mLLVMContext);
 	auto int32Ty = llvm::Type::getInt32Ty(*mLLVMContext);
-	auto int8PtrTy = int8Ty->getPointerTo();
 
 	if (auto loadInst = llvm::dyn_cast<llvm::LoadInst>(val))
 	{
 		mIRBuilder->CreateMemCpy(
-			mIRBuilder->CreateBitCast(ptr.mValue, int8PtrTy),
+			ptr.mValue,
 			llvm::MaybeAlign(1),
-			mIRBuilder->CreateBitCast(loadInst->getPointerOperand(), int8PtrTy),
+			loadInst->getPointerOperand(),
 			llvm::MaybeAlign(1),
 			llvm::ConstantInt::get(int32Ty, arrayBytes));
 		return true;
@@ -1765,7 +1761,7 @@ bool BfIRCodeGen::TryMemCpy(const BfIRTypedValue& ptr, llvm::Value* val)
 	if (llvm::isa<llvm::ConstantAggregateZero>(constVal))
 	{
 		mIRBuilder->CreateMemSet(
-			mIRBuilder->CreateBitCast(ptr.mValue, int8PtrTy),
+			ptr.mValue,
 			llvm::ConstantInt::get(int8Ty, 0),
 			llvm::ConstantInt::get(int32Ty, arrayBytes),
 			llvm::MaybeAlign(1));
@@ -1783,9 +1779,9 @@ bool BfIRCodeGen::TryMemCpy(const BfIRTypedValue& ptr, llvm::Value* val)
 		llvm::GlobalValue::NotThreadLocal);
 
 	mIRBuilder->CreateMemCpy(
-		mIRBuilder->CreateBitCast(ptr.mValue, int8PtrTy),
+		ptr.mValue,
 		llvm::MaybeAlign(1),
-		mIRBuilder->CreateBitCast(globalVariable, int8PtrTy),
+		globalVariable,
 		llvm::MaybeAlign(1),
 		llvm::ConstantInt::get(int32Ty, arrayBytes));
 
@@ -1802,8 +1798,7 @@ bool BfIRCodeGen::TryVectorCpy(const BfIRTypedValue& ptr, llvm::Value* val)
 		return false;
 	}
 
-	auto usePtr = mIRBuilder->CreateBitCast(ptr.mValue, val->getType()->getPointerTo());
-	mIRBuilder->CreateAlignedStore(val, usePtr, llvm::MaybeAlign(1));
+	mIRBuilder->CreateAlignedStore(val, ptr.mValue, llvm::MaybeAlign(1));
 
 	return true;
 }
@@ -1953,22 +1948,18 @@ void BfIRCodeGen::CreateMemSet(llvm::Value* addr, llvm::Value* val, llvm::Value*
 
 			int curOffset = 0;
 			int sizeLeft = (int)sizeVal;
-			llvm::Value* headVal;
 
 			if (mPtrSize >= 8)
 			{
-				headVal = NULL;
 				auto intTy = llvm::Type::getInt64Ty(*mLLVMContext);
 				auto constVal = llvm::ConstantInt::get(intTy,
 					((int64)setVal << 56) | ((int64)setVal << 48) | ((int64)setVal << 40) | ((int64)setVal << 32) |
 					((int64)setVal << 24) | ((int64)setVal << 16) | ((int64)setVal << 8) | ((int64)setVal));
 				while (sizeLeft >= 8)
 				{
-					if (headVal == NULL)
-						headVal = mIRBuilder->CreateBitCast(addr, intTy->getPointerTo());
-					llvm::Value* ptrVal = headVal;
+					llvm::Value* ptrVal = addr;
 					if (curOffset != 0)
-						ptrVal = mIRBuilder->CreateConstInBoundsGEP1_32(intTy, headVal, curOffset / 8);
+						ptrVal = mIRBuilder->CreateConstInBoundsGEP1_32(intTy, addr, curOffset / 8);
 					mIRBuilder->CreateStore(constVal, ptrVal, isVolatile);
 
 					curOffset += 8;
@@ -1978,16 +1969,13 @@ void BfIRCodeGen::CreateMemSet(llvm::Value* addr, llvm::Value* val, llvm::Value*
 
 			if (sizeLeft >= 4)
 			{
-				headVal = NULL;
 				auto intTy = llvm::Type::getInt32Ty(*mLLVMContext);
 				auto constVal = llvm::ConstantInt::get(intTy, ((int)setVal << 24) | ((int)setVal << 16) | ((int)setVal << 8) | ((int)setVal), /*IsSigned*/false, /*ImplicitTrunc*/true);
 				while (sizeLeft >= 4)
 				{
-					if (headVal == NULL)
-						headVal = mIRBuilder->CreateBitCast(addr, intTy->getPointerTo());
-					llvm::Value* ptrVal = headVal;
+					llvm::Value* ptrVal = addr;
 					if (curOffset != 0)
-						ptrVal = mIRBuilder->CreateConstInBoundsGEP1_32(intTy, headVal, curOffset / 4);
+						ptrVal = mIRBuilder->CreateConstInBoundsGEP1_32(intTy, addr, curOffset / 4);
 					mIRBuilder->CreateStore(constVal, ptrVal, isVolatile);
 
 					curOffset += 4;
@@ -1997,16 +1985,13 @@ void BfIRCodeGen::CreateMemSet(llvm::Value* addr, llvm::Value* val, llvm::Value*
 
 			if (sizeLeft >= 2)
 			{
-				headVal = NULL;
 				auto intTy = llvm::Type::getInt16Ty(*mLLVMContext);
 				auto constVal = llvm::ConstantInt::get(intTy, ((int)setVal << 8) | ((int)setVal));
 				while (sizeLeft >= 2)
 				{
-					if (headVal == NULL)
-						headVal = mIRBuilder->CreateBitCast(addr, intTy->getPointerTo());
-					llvm::Value* ptrVal = headVal;
+					llvm::Value* ptrVal = addr;
 					if (curOffset != 0)
-						ptrVal = mIRBuilder->CreateConstInBoundsGEP1_32(intTy, headVal, curOffset / 2);
+						ptrVal = mIRBuilder->CreateConstInBoundsGEP1_32(intTy, addr, curOffset / 2);
 					mIRBuilder->CreateStore(constVal, ptrVal, isVolatile);
 
 					curOffset += 2;
@@ -2016,16 +2001,13 @@ void BfIRCodeGen::CreateMemSet(llvm::Value* addr, llvm::Value* val, llvm::Value*
 
 			if (sizeLeft >= 1)
 			{
-				headVal = NULL;
 				auto intTy = llvm::Type::getInt8Ty(*mLLVMContext);
 				auto constVal = llvm::ConstantInt::get(intTy, ((int)setVal));
 				while (sizeLeft >= 1)
 				{
-					if (headVal == NULL)
-						headVal = mIRBuilder->CreateBitCast(addr, intTy->getPointerTo());
-					llvm::Value* ptrVal = headVal;
+					llvm::Value* ptrVal = addr;
 					if (curOffset != 0)
-						ptrVal = mIRBuilder->CreateConstInBoundsGEP1_32(intTy, headVal, curOffset / 1);
+						ptrVal = mIRBuilder->CreateConstInBoundsGEP1_32(intTy, addr, curOffset / 1);
 					mIRBuilder->CreateStore(constVal, ptrVal, isVolatile);
 
 					curOffset += 1;
@@ -3734,7 +3716,7 @@ void BfIRCodeGen::HandleNextCmd()
 						globalVar->setLinkage(llvm::GlobalValue::LinkageTypes::ExternalLinkage);
 						globalVar->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
 
-						SetResult(curId, llvm::ConstantExpr::getBitCast(globalVar, charType->getPointerTo()));
+						SetResult(curId, globalVar);
 						break;
 					}
 
@@ -4177,8 +4159,7 @@ void BfIRCodeGen::HandleNextCmd()
 							}
 							auto value = TryToVector(args[1]);
 							auto shuffled = mIRBuilder->CreateShuffleVector(value, value, inverse);
-							auto ptr = mIRBuilder->CreateBitCast(args[0].mValue, shuffled->getType()->getPointerTo());
-							SetResult(curId, mIRBuilder->CreateAlignedStore(shuffled, ptr, llvm::MaybeAlign(1)));
+							SetResult(curId, mIRBuilder->CreateAlignedStore(shuffled, args[0].mValue, llvm::MaybeAlign(1)));
 						}
 						else
 							SetResult(curId, mIRBuilder->CreateShuffleVector(val0, sourceCount == 2 ? TryToVector(args[1]) : val0, intMask));
@@ -4647,8 +4628,7 @@ void BfIRCodeGen::HandleNextCmd()
 							}
 							else
 							{
-								auto castedRes = mIRBuilder->CreateBitCast(args[0].mValue, intrinsicData->mReturnType->mLLVMType->getPointerTo());
-								result.mValue = mIRBuilder->CreateAlignedLoad(intrinsicData->mReturnType->mLLVMType, castedRes, llvm::MaybeAlign(1));
+								result.mValue = mIRBuilder->CreateAlignedLoad(intrinsicData->mReturnType->mLLVMType, args[0].mValue, llvm::MaybeAlign(1));
 							}
 						}
 						else if ((arg0Type->isVectorTy()) && (intrinsicData->mReturnType->mLLVMType->isVectorTy()))
@@ -4667,8 +4647,7 @@ void BfIRCodeGen::HandleNextCmd()
 						auto argType = GetLLVMTypeById((int)constInt->getSExtValue());
 						auto vaArgVal = mIRBuilder->CreateVAArg(args[0].mValue, argType);
 
-						auto resultPtr = mIRBuilder->CreateBitCast(args[1].mValue, argType->getPointerTo());
-						mIRBuilder->CreateStore(vaArgVal, resultPtr);
+						mIRBuilder->CreateStore(vaArgVal, args[1].mValue);
 					}
 					break;
 				default:
@@ -5244,8 +5223,7 @@ void BfIRCodeGen::HandleNextCmd()
 
 				// This is generates slower code than the inline asm in debug mode, but can optimize well in release
 				auto int8Ty = llvm::Type::getInt8Ty(*mLLVMContext);
-				auto int8Ptr = irBuilder->CreateBitCast(val, int8Ty->getPointerTo());
-				auto int8Val = irBuilder->CreateLoad(int8Ty, int8Ptr);
+				auto int8Val = irBuilder->CreateLoad(int8Ty, val);
 				auto cmpResult = irBuilder->CreateICmpUGE(int8Val, llvm::ConstantInt::get(int8Ty, 0x80));
 
 				auto failBB = llvm::BasicBlock::Create(*mLLVMContext, "access.fail");
