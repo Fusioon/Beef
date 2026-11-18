@@ -283,12 +283,38 @@ static
 		{
 			data = new [Align(align)] uint8[size]* ( ? );
 			defer:mixin delete data;
+#if BF_ENABLE_REALTIME_LEAK_CHECK
+			// The GC does not scan a raw uint8 block: what the data references would look leaked. The marker has it scanned
+			//  until the end of the scope, after the destructor below (deferred calls run in reverse order)
+			if ((typeof(T).IsObject) || (typeof(T).WantsMark))
+				scope:mixin ScopedAllocMarker(data, size);
+#endif
 			// Destroy the custom-allocated object before freeing its raw buffer.
 			if (typeof(T).IsObject)
 				defer:mixin delete:null Internal.UnsafeCastToObject(data);
 		}
 		data
 	}
+
+#if BF_ENABLE_REALTIME_LEAK_CHECK
+	/// Has the GC scan a heap block of ScopedAlloc while it lives: a scope object is on its thread's stack-markable list
+	class ScopedAllocMarker
+	{
+		void* mPtr;
+		int mSize;
+
+		public this(void* ptr, int size)
+		{
+			mPtr = ptr;
+			mSize = size;
+		}
+
+		protected override void GCMarkMembers()
+		{
+			GC.Mark(mPtr, mSize);
+		}
+	}
+#endif
 
 	public static mixin ScopedAllocZero(int size, int align)
 	{
